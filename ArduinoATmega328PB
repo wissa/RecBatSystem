@@ -1,0 +1,99 @@
+#include <Wire1.h> // Use Wire1 for the second I2C port (ATmega328PB)
+
+#define ADS1115_ADDRESS 0x48 // I2C address of the ADS1115
+
+// Register addresses
+#define ADS1115_REG_CONVERT   0x00
+#define ADS1115_REG_CONFIG    0x01
+
+// Configuration values
+#define ADS1115_PGA_2_048V    0x0400 // ±2.048V range
+#define ADS1115_DATARATE_1600SPS 0x0080 // 1600 samples per second
+#define ADS1115_MODE_SINGLESHOT 0x0100 // Single-shot mode
+#define ADS1115_OS_START      0x8000 // Start a conversion
+#define ADS1115_MUX_CH0       0x4000
+#define ADS1115_MUX_CH1       0x5000
+#define ADS1115_MUX_CH2       0x6000
+#define ADS1115_MUX_CH3       0x7000
+
+#define ADS1115_CONVERSION_DELAY 8
+
+void setup() {
+  Serial.begin(9600);
+  Wire1.begin(); // Initialize the second I2C bus
+}
+
+void loop() {
+  float channel1 = calculateCurrent(readADS1115(0), 2.5, 50, 0.001); // Channel 1
+  float channel2 = calculateCurrent(readADS1115(1), 0, 50, 0.05);    // Channel 2
+  float channel3 = calculateVoltage(readADS1115(2), 22.0 / 144.0);   // Channel 3
+  float channel4 = calculateVoltage(readADS1115(3), 22.0 / 144.0);   // Channel 4
+
+  Serial.print("Channel 1 Current: ");
+  Serial.print(channel1);
+  Serial.println(" A");
+
+  Serial.print("Channel 2 Current: ");
+  Serial.print(channel2);
+  Serial.println(" A");
+
+  Serial.print("Channel 3 Voltage: ");
+  Serial.print(channel3);
+  Serial.println(" V");
+
+  Serial.print("Channel 4 Voltage: ");
+  Serial.print(channel4);
+  Serial.println(" V");
+
+  delay(1000); // Delay between readings
+}
+
+int16_t readADS1115(uint8_t channel) {
+  uint16_t config = ADS1115_OS_START           // Start a single conversion
+                  | ADS1115_MODE_SINGLESHOT    // Single-shot mode
+                  | ADS1115_PGA_2_048V         // ±2.048V range
+                  | ADS1115_DATARATE_1600SPS;  // 1600 samples per second
+
+  // Set the MUX based on the channel
+  switch (channel) {
+    case 0: config |= ADS1115_MUX_CH0; break;
+    case 1: config |= ADS1115_MUX_CH1; break;
+    case 2: config |= ADS1115_MUX_CH2; break;
+    case 3: config |= ADS1115_MUX_CH3; break;
+    default: return 0; // Invalid channel
+  }
+
+  // Write configuration to the ADS1115
+  Wire1.beginTransmission(ADS1115_ADDRESS);
+  Wire1.write(ADS1115_REG_CONFIG);
+  Wire1.write((uint8_t)(config >> 8)); // High byte
+  Wire1.write((uint8_t)(config & 0xFF)); // Low byte
+  Wire1.endTransmission();
+
+  // Wait for the conversion to complete
+  delay(ADS1115_CONVERSION_DELAY);
+
+  // Read the conversion result
+  Wire1.beginTransmission(ADS1115_ADDRESS);
+  Wire1.write(ADS1115_REG_CONVERT);
+  Wire1.endTransmission();
+
+  Wire1.requestFrom(ADS1115_ADDRESS, (uint8_t)2);
+  if (Wire1.available() >= 2) {
+    uint16_t highByte = Wire1.read();
+    uint16_t lowByte = Wire1.read();
+    return (int16_t)((highByte << 8) | lowByte); // Combine bytes into a 16-bit result
+  }
+
+  return 0; // Return 0 if no data was available
+}
+
+float calculateCurrent(int16_t adcValue, float referenceVoltage, float gain, float shuntResistor) {
+  float voltage = adcValue * 0.0000625; // Convert ADC value to voltage (62.5uV per count)
+  return (voltage - referenceVoltage) / (gain * shuntResistor); // Calculate current
+}
+
+float calculateVoltage(int16_t adcValue, float dividerGain) {
+  float voltage = adcValue * 0.0000625; // Convert ADC value to voltage
+  return voltage / dividerGain; // Adjust for voltage divider
+}
