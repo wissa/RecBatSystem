@@ -3,76 +3,63 @@
 
 #include <Wire1.h>
 
-/**
- * @brief Library for controlling the ADS1115 using Wire1 (ATmega328PB).
- * 
- * Features:
- * - Read single-ended channels (CH0 to CH3).
- * - Convert raw ADC readings into current or voltage.
- * - Adjustable gain and reference voltage.
- */
-
-#define ADS1115_ADDRESS 0x48 // Default I2C address for ADS1115
+// Default I2C address for ADS1115
+#define ADS1115_ADDRESS 0x48
 
 // Register Addresses
 #define ADS1115_REG_CONVERT   0x00 // Conversion register
 #define ADS1115_REG_CONFIG    0x01 // Configuration register
 
-// Default Configurations
-#define ADS1115_PGA_2_048V    0x0400 // ±2.048V range (gain)
-#define ADS1115_DATARATE_1600SPS 0x0080 // 1600 samples per second
-#define ADS1115_MODE_SINGLESHOT 0x0100 // Single-shot mode
-#define ADS1115_OS_START      0x8000 // Start a conversion
+// Gain Settings (PGA)
+#define ADS1115_PGA_6_144V    0x0000 // ±6.144V range (187.5 µV/LSB)
+#define ADS1115_PGA_4_096V    0x0200 // ±4.096V range (125 µV/LSB)
+#define ADS1115_PGA_2_048V    0x0400 // ±2.048V range (62.5 µV/LSB) - Default
+#define ADS1115_PGA_1_024V    0x0600 // ±1.024V range (31.25 µV/LSB)
+#define ADS1115_PGA_0_512V    0x0800 // ±0.512V range (15.625 µV/LSB)
+#define ADS1115_PGA_0_256V    0x0A00 // ±0.256V range (7.8125 µV/LSB)
 
-// MUX settings for single-ended channels
+// Data Rate Settings
+#define ADS1115_DATARATE_8SPS    0x0000 // 8 samples per second
+#define ADS1115_DATARATE_16SPS   0x0020 // 16 samples per second
+#define ADS1115_DATARATE_32SPS   0x0040 // 32 samples per second
+#define ADS1115_DATARATE_64SPS   0x0060 // 64 samples per second
+#define ADS1115_DATARATE_128SPS  0x0080 // 128 samples per second (default)
+#define ADS1115_DATARATE_250SPS  0x00A0 // 250 samples per second
+#define ADS1115_DATARATE_475SPS  0x00C0 // 475 samples per second
+#define ADS1115_DATARATE_860SPS  0x00E0 // 860 samples per second (fastest)
+
+// Mode Settings
+#define ADS1115_MODE_CONTINUOUS  0x0000 // Continuous conversion mode
+#define ADS1115_MODE_SINGLESHOT  0x0100 // Single-shot mode (default)
+
+// MUX Settings for Single-Ended Channels
 #define ADS1115_MUX_CH0 0x4000
 #define ADS1115_MUX_CH1 0x5000
 #define ADS1115_MUX_CH2 0x6000
 #define ADS1115_MUX_CH3 0x7000
 
-// Conversion delay (in milliseconds)
-#define ADS1115_CONVERSION_DELAY 8 // Minimum time for conversion to complete
+// Operational Status (OS) Bit
+#define ADS1115_OS_START 0x8000 // Start single-shot conversion
 
 class ADS1115 {
 public:
-    /**
-     * @brief Constructor to initialize the ADS1115.
-     * @param address I2C address of the ADS1115 (default: 0x48).
-     */
     ADS1115(uint8_t address = ADS1115_ADDRESS);
 
-    /**
-     * @brief Initializes the Wire1 library and sets up the device.
-     */
     void begin();
-
-    /**
-     * @brief Reads raw ADC value from the specified channel.
-     * @param channel Channel number (0-3).
-     * @return Raw ADC value (16-bit signed).
-     */
+    void configure(uint16_t gain = ADS1115_PGA_4_096V,
+                   uint16_t dataRate = ADS1115_DATARATE_128SPS,
+                   uint16_t mode = ADS1115_MODE_SINGLESHOT);
+    void setGain(uint16_t gain);
     int16_t readRaw(uint8_t channel);
-
-    /**
-     * @brief Converts raw ADC value to voltage.
-     * @param rawValue Raw ADC value.
-     * @return Voltage in volts.
-     */
     float rawToVoltage(int16_t rawValue);
-
-    /**
-     * @brief Converts raw ADC value to current based on shunt resistor and gain.
-     * @param rawValue Raw ADC value.
-     * @param referenceVoltage Reference voltage for the measurement (e.g., 2.5V for bidirectional currents).
-     * @param gain Gain of the current sensor.
-     * @param shuntResistor Shunt resistor value in ohms.
-     * @return Current in amperes.
-     */
     float rawToCurrent(int16_t rawValue, float referenceVoltage, float gain, float shuntResistor);
 
 private:
-    uint8_t _address; // I2C address
-    void configureChannel(uint8_t channel); // Configures the ADS1115 for the specified channel
+    uint8_t _address;
+    uint16_t _gain;
+    uint16_t _dataRate;
+    uint16_t _mode;
+    void configureChannel(uint8_t channel);
 };
 
 #endif
