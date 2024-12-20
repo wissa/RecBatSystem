@@ -1,0 +1,91 @@
+#include <Wire.h>
+
+#define SLAVE_ADDRESS 0x11
+
+// Helper union to easily convert 4 bytes to float
+union FloatUnion {
+  float value;
+  byte  b[4];
+};
+
+void setup() {
+  Wire.begin(); // Master mode by default
+  Serial.begin(9600);
+  Serial.println("Master initialized.");
+}
+
+void loop() {
+  // Example 1: Ask for battery Voltage
+  sendCommand('V');
+  float voltage = requestFloatData();
+  Serial.print("Voltage: ");
+  Serial.println(voltage, 2);
+
+  // Example 2: Ask for battery Current
+  sendCommand('I');
+  float current = requestFloatData();
+  Serial.print("Current: ");
+  Serial.println(current, 2);
+
+  // Example 3: Ask for battery SOC
+  sendCommand('S');
+  float soc = requestFloatData();
+  Serial.print("SOC: ");
+  Serial.println(soc, 2);
+
+  // Example 4: Ask for “All” data (Voltage, Current, SOC)
+  sendCommand('A');
+  float allData[3];
+  requestMultipleFloats(allData, 3);
+  Serial.print("All -> V: ");
+  Serial.print(allData[0], 2);
+  Serial.print(" | I: ");
+  Serial.print(allData[1], 2);
+  Serial.print(" | SOC: ");
+  Serial.println(allData[2], 2);
+
+  // Example 5: Turn on LED at Slave side (no data request afterward)
+  sendCommand('L');
+  // (No requestFrom here, maybe we only want the action, not data)
+
+  delay(3000); // Wait some time before repeating
+}
+
+// Send a single-byte command to the slave
+void sendCommand(char cmd) {
+  Wire.beginTransmission(SLAVE_ADDRESS);
+  Wire.write(cmd);             // e.g. 'V', 'I', 'S', 'A', 'L'
+  Wire.endTransmission();      // Actually send the byte(s)
+  delay(10);                   // Small delay to let Slave process
+}
+
+// Request a single float (4 bytes) from the slave
+float requestFloatData() {
+  float result = 0.0f;
+  Wire.requestFrom(SLAVE_ADDRESS, (uint8_t)4); // Expecting 4 bytes
+  if (Wire.available() == 4) {
+    FloatUnion fu;
+    for (int i = 0; i < 4; i++) {
+      fu.b[i] = Wire.read();
+    }
+    result = fu.value;
+  }
+  return result;
+}
+
+// Request multiple floats in a row (e.g. "A" command returns 3 floats → 12 bytes)
+void requestMultipleFloats(float* buffer, int count) {
+  int totalBytes = count * 4; // each float = 4 bytes
+  Wire.requestFrom(SLAVE_ADDRESS, (uint8_t)totalBytes);
+  
+  int bytesRead = 0;
+  while (Wire.available() && bytesRead < totalBytes) {
+    // Read each float in chunks of 4 bytes
+    FloatUnion fu;
+    for (int i = 0; i < 4; i++) {
+      fu.b[i] = Wire.read();
+      bytesRead++;
+    }
+    *buffer++ = fu.value; // store the float in the array
+  }
+}
