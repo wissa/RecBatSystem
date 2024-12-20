@@ -1,0 +1,100 @@
+#include <Wire.h>
+
+// Set a unique address for this Slave
+#define SLAVE_ADDRESS 0x11
+
+// Example pins (adjust for your board)
+#define LED_PIN 4
+
+// Simulated battery data
+float batteryVoltage = 12.34;
+float batteryCurrent = 0.56;
+float batterySoc     = 78.9;
+
+volatile bool ledState = LOW; // Must be volatile since it's used in an ISR
+
+// This variable stores the last command received from the Master
+char lastCommand = '\0';
+
+
+void setup() {
+  // Initialize Slave with its address
+  Wire.begin(SLAVE_ADDRESS);
+  Wire.setClock(100000);
+  // Attach event handlers
+  Wire.onReceive(receiveEvent);   // Called when Master writes to this Slave
+  Wire.onRequest(requestEvent);   // Called when Master requests data from this Slave
+
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(7, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+    Serial.begin(9600);
+  Serial.println("Slave (Battery Monitor) initialized.");
+
+//attachInterrupt(digitalPinToInterrupt(2), toggleLED, FALLING);
+
+}
+
+// Called automatically when Master sends data to Slave
+void receiveEvent(int numBytes) {
+  // Read the command (assuming Master sends exactly one byte for the command)
+  if (numBytes > 0) {
+    lastCommand = Wire.read();  // e.g. 'V', 'I', 'S', 'A', 'L', etc.
+    Serial.println(lastCommand);
+
+    // If the command is 'L', for example, we might toggle or turn on an LED immediately
+    if (lastCommand == 'L') {
+      // Turn LED on (or toggle)
+      
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      Wire.write("Walid", 5);
+      // If you wanted toggle, you could do: digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
+  }
+}
+
+// Called automatically when Master requests data from Slave (Wire.requestFrom)
+void requestEvent() {
+  // Decide what to send based on lastCommand
+  if (lastCommand == 'V') {
+    // Send battery Voltage (4 bytes for a float)
+    Wire.write((byte*)&batteryVoltage, sizeof(batteryVoltage));
+
+    //Wire.write("Walid", 5);
+  }
+  else if (lastCommand == 'I') {
+    // Send battery Current (4 bytes)
+    Wire.write((byte*)&batteryCurrent, sizeof(batteryCurrent));
+  }
+  else if (lastCommand == 'S') {
+    // Send battery State of Charge (4 bytes)
+    Wire.write((byte*)&batterySoc, sizeof(batterySoc));
+  }
+  else if (lastCommand == 'A') {
+    // Send all 3 floats in sequence: Voltage, Current, SOC (12 bytes total)
+    Wire.write((byte*)&batteryVoltage, sizeof(batteryVoltage));
+    Wire.write((byte*)&batteryCurrent, sizeof(batteryCurrent));
+    Wire.write((byte*)&batterySoc,     sizeof(batterySoc));
+  }
+  else {
+    // Unknown or no command: send nothing or send a status code
+    // For demonstration, we’ll send nothing
+    //Wire.write((byte*)&batteryVoltage, sizeof(batteryVoltage));
+    //digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+}
+
+
+
+void loop() {
+  // In a real setup, you'd periodically measure the actual battery stats (via analogRead or sensors)
+  // For demonstration, we just randomize them slightly
+  //batteryVoltage = 12.0f + (float)random(0, 100) / 100.0f; // 12.00 to 12.99
+  //batteryCurrent = 0.5f  + (float)random(0, 50)  / 100.0f; // 0.50 to 0.99
+  //batterySoc     = 80.0f + (float)random(0, 20);           // 80 to 99
+  delay(1000);
+  //Wire.write((byte*)&batteryCurrent, sizeof(batteryCurrent)); 
+  digitalWrite(7, !digitalRead(7));
+}
+
