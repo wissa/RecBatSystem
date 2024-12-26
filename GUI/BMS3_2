@@ -1,0 +1,652 @@
+import sys
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import re
+import logging
+import csv
+import os
+from datetime import datetime
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QLabel, QListWidget, QMessageBox, QVBoxLayout, QWidget, QInputDialog,
+    QPushButton, QComboBox, QHBoxLayout, QCheckBox, QGroupBox, QGridLayout, QLineEdit, QFileDialog
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QTimer
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+# Initialize logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
+SERIAL_BAUDRATE = 9600
+SERIAL_TIMEOUT = 1  # seconds
+SLAVE_TIMEOUT_MS = 15000  # milliseconds
+
+# Fault bits definition
+FAULT_BITS = {
+    0: "Over Voltage",
+    1: "Under Voltage",
+    2: "Over Current",
+    3: "Over Temperature",
+    4: "Communication Error",
+    5: "Balance Failure",
+    6: "Protection Triggered",
+    7: "Unknown Fault"
+}
+
+# Communicate class for signals
+class Communicate(QObject):
+    data_received = pyqtSignal(dict)
+    slave_detected = pyqtSignal(str)
+    slave_lost = pyqtSignal(str)
+    fault_updated = pyqtSignal(str)
+
+# SerialThread class
+class SerialThread(threading.Thread):
+    def __init__(self, serial_port, communicator):
+        super().__init__()
+        self.serial_port = serial_port
+        self.communicator = communicator
+        self.running = True
+        self.slave_last_seen = {}
+        self.current_slave = None
+        self.temp_data = {}
+
+    def run(self):
+        buffer = ""
+        while self.running:
+            try:
+                if self.serial_port.in_waiting:
+                    data = self.serial_port.read(self.serial_port.in_waiting).decode('utf-8', errors='ignore')
+                    logging.debug(f"Raw data received: {data}")
+                    buffer += data
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        logging.debug(f"Processing line: {line}")
+                        self.process_line(line)
+                time.sleep(0.1)
+            except serial.SerialException as e:
+                logging.error(f"Serial Exception: {e}")
+                self.communicator.fault_updated.emit(f"Serial Error: {str(e)}")
+                self.running = False
+            except Exception as e:
+                logging.error(f"Exception: {e}")
+                self.communicator.fault_updated.emit(f"Error: {str(e)}")
+
+    def process_line(self, line):
+        logging.debug(f"Received line: {line}")
+        if line.startswith("Data from slave"):
+            # Extract address
+            match = re.match(r"Data from slave (0x[0-9A-Fa-f]{2}):?", line)
+            if match:
+                address = match.group(1).strip()
+                self.current_slave = address
+                self.temp_data = {'address': address}
+                logging.debug(f"Current slave set to: {address}")
+                # Check if data is on the same line
+                data_part = line.split(":", 1)
+                if len(data_part) > 1 and data_part[1].strip():
+                    self.parse_measurements(data_part[1].strip())
+        elif self.current_slave:
+            if re.match(r"-+", line):
+                # Separator line, reset current_slave
+                logging.debug("Separator line received. Resetting current_slave.")
+                self.current_slave = None
+                self.temp_data = {}
+                return
+            self.parse_measurements(line)
+            # Check if all expected fields are received
+            expected_fields = ['Voltage', 'Current', 'SoC', 'Vcc', 'Temp', 'Balance Current', 'Terminal Voltage', 'Faults Reg']
+            if all(field in self.temp_data for field in expected_fields):
+                # Emit data_received signal
+                logging.debug(f"Complete data received for {self.current_slave}: {self.temp_data}")
+                self.communicator.data_received.emit(self.temp_data)
+                # Update last seen
+                self.slave_last_seen[self.current_slave] = time.time()
+                # Reset current_slave and temp_data
+                self.current_slave = None
+                self.temp_data = {}
+        else:
+            logging.debug("Unknown line format.")
+
+    def parse_measurements(self, line):
+        # Example line: "Voltage: 3.40 V, Current: 0.00 A, SoC: 78.0 %"
+        measurements = line.split(", ")
+        for measurement in measurements:
+            if ": " in measurement:
+                key, value = measurement.split(": ", 1)
+                self.temp_data[key.strip()] = value.strip()
+                logging.debug(f"Parsed {key.strip()}: {value.strip()}")
+
+    def send_command(self, command):
+        try:
+            self.serial_port.write((command + '\n').encode('utf-8'))
+            logging.debug(f"Sent command: {command}")
+        except serial.SerialException as e:
+            logging.error(f"Serial Write Error: {e}")
+            self.communicator.fault_updated.emit(f"Serial Write Error: {str(e)}")
+
+    def stop(self):
+        self.running = False
+
+# Matplotlib Canvas
+class MplCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=10, height=6, dpi=100):
+        fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = fig.add_subplot(111)
+        super().__init__(fig)
+        self.fig = fig
+
+# MainWindow class
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Battery Management GUI")
+        self.setGeometry(100, 100, 1400, 900)
+
+        # Initialize communicator
+        self.communicator = Communicate()
+        self.communicator.data_received.connect(self.update_data)
+        self.communicator.slave_detected.connect(self.handle_slave_detected)
+        self.communicator.slave_lost.connect(self.handle_slave_lost)
+        self.communicator.fault_updated.connect(self.update_fault_label)
+
+        # Initialize serial connection
+        self.serial_port = self.init_serial()
+        if not self.serial_port:
+            QMessageBox.critical(self, "Serial Port Error", "No serial port found or unable to open.")
+            sys.exit(1)
+
+        # Start serial thread
+        self.serial_thread = SerialThread(self.serial_port, self.communicator)
+        self.serial_thread.start()
+
+        # Setup UI components
+        self.init_ui()
+
+        # Data storage for graphing
+        self.graph_data = {}  # {slave_address: {'time': [], 'Voltage': [], 'Current': [], ...}}
+        self.recording = False
+        self.csv_files = {}
+        self.csv_writer = {}
+        self.start_time = None
+        self.csv_path = ""
+
+        # Timer to check for slave timeouts
+        self.timeout_timer = QTimer()
+        self.timeout_timer.timeout.connect(self.check_slave_timeouts)
+        self.timeout_timer.start(1000)  # Check every second
+
+    def init_serial(self):
+        ports = list(serial.tools.list_ports.comports())
+        if not ports:
+            logging.error("No serial ports found.")
+            return None
+        # Let user select the serial port
+        port_names = [port.device for port in ports]
+        port, ok = QInputDialog.getItem(self, "Select Serial Port", "Available Ports:", port_names, 0, False)
+        if not ok or not port:
+            logging.error("No serial port selected.")
+            return None
+        try:
+            ser = serial.Serial(port, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
+            logging.debug(f"Opened serial port: {port}")
+            return ser
+        except serial.SerialException as e:
+            logging.error(f"Unable to open serial port {port}: {e}")
+            return None
+
+    def init_ui(self):
+        # Main layout
+        main_layout = QVBoxLayout()
+
+        # Top labels
+        top_layout = QHBoxLayout()
+        self.slaves_label = QLabel("Slaves Detected: 0")
+        self.fault_label = QLabel("Faults: None")
+        top_layout.addWidget(self.slaves_label)
+        top_layout.addStretch()
+        top_layout.addWidget(self.fault_label)
+        main_layout.addLayout(top_layout)
+
+        # Slave selector with multi-selection
+        selector_layout = QHBoxLayout()
+        selector_label = QLabel("Select Slaves:")
+        self.slave_selector = QListWidget()
+        self.slave_selector.setSelectionMode(QListWidget.MultiSelection)
+        self.slave_selector.itemSelectionChanged.connect(self.on_slave_selected)
+        selector_layout.addWidget(selector_label)
+        selector_layout.addWidget(self.slave_selector)
+        selector_layout.addStretch()
+        main_layout.addLayout(selector_layout)
+
+        # Parameter selection for graph
+        param_layout = QHBoxLayout()
+        param_label = QLabel("Select Parameters to Plot:")
+        self.param_voltage = QCheckBox("Voltage (V)")
+        self.param_current = QCheckBox("Current (A)")
+        self.param_soc = QCheckBox("State of Charge (%)")
+        self.param_temp = QCheckBox("Temperature (°C)")
+        self.param_vcc = QCheckBox("Vcc (V)")
+        self.param_bal_current = QCheckBox("Balance Current (A)")
+        self.param_ter_voltage = QCheckBox("Terminal Voltage (V)")
+        self.param_faults = QCheckBox("Faults Reg")
+        # Connect checkboxes to update graph
+        self.param_voltage.stateChanged.connect(self.update_graph_plot)
+        self.param_current.stateChanged.connect(self.update_graph_plot)
+        self.param_soc.stateChanged.connect(self.update_graph_plot)
+        self.param_temp.stateChanged.connect(self.update_graph_plot)
+        self.param_vcc.stateChanged.connect(self.update_graph_plot)
+        self.param_bal_current.stateChanged.connect(self.update_graph_plot)
+        self.param_ter_voltage.stateChanged.connect(self.update_graph_plot)
+        self.param_faults.stateChanged.connect(self.update_graph_plot)
+
+        param_layout.addWidget(param_label)
+        param_layout.addWidget(self.param_voltage)
+        param_layout.addWidget(self.param_current)
+        param_layout.addWidget(self.param_soc)
+        param_layout.addWidget(self.param_temp)
+        param_layout.addWidget(self.param_vcc)
+        param_layout.addWidget(self.param_bal_current)
+        param_layout.addWidget(self.param_ter_voltage)
+        param_layout.addWidget(self.param_faults)
+        param_layout.addStretch()
+        main_layout.addLayout(param_layout)
+
+        # Graph area
+        self.canvas = MplCanvas(self, width=12, height=6, dpi=100)
+        main_layout.addWidget(self.canvas)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        self.set_battery_btn = QPushButton("Set Battery")
+        self.set_protection_btn = QPushButton("Set Protection")
+        self.set_switching_btn = QPushButton("Set Switching")
+        self.start_record_btn = QPushButton("Start Recording")
+        self.stop_record_btn = QPushButton("Stop Recording")
+        self.stop_record_btn.setEnabled(False)
+        button_layout.addWidget(self.set_battery_btn)
+        button_layout.addWidget(self.set_protection_btn)
+        button_layout.addWidget(self.set_switching_btn)
+        button_layout.addWidget(self.start_record_btn)
+        button_layout.addWidget(self.stop_record_btn)
+        button_layout.addStretch()
+        main_layout.addLayout(button_layout)
+
+        # Connect buttons to functions
+        self.set_battery_btn.clicked.connect(self.set_battery)
+        self.set_protection_btn.clicked.connect(self.set_protection)
+        self.set_switching_btn.clicked.connect(self.set_switching)
+        self.start_record_btn.clicked.connect(self.start_recording)
+        self.stop_record_btn.clicked.connect(self.stop_recording)
+
+        # Settings Panel
+        settings_group = QGroupBox("Settings")
+        settings_layout = QGridLayout()
+
+        self.address_assign_input = QLineEdit("10000")
+        self.data_collect_input = QLineEdit("5000")
+        self.slave_timeout_input = QLineEdit("15000")
+        self.max_slaves_input = QLineEdit("50")
+        self.save_settings_btn = QPushButton("Save Settings")
+
+        settings_layout.addWidget(QLabel("ADDRESS_ASSIGN_INTERVAL (ms):"), 0, 0)
+        settings_layout.addWidget(self.address_assign_input, 0, 1)
+        settings_layout.addWidget(QLabel("DATA_COLLECTION_INTERVAL (ms):"), 1, 0)
+        settings_layout.addWidget(self.data_collect_input, 1, 1)
+        settings_layout.addWidget(QLabel("SLAVE_TIMEOUT (ms):"), 2, 0)
+        settings_layout.addWidget(self.slave_timeout_input, 2, 1)
+        settings_layout.addWidget(QLabel("MAX_SLAVES:"), 3, 0)
+        settings_layout.addWidget(self.max_slaves_input, 3, 1)
+        settings_layout.addWidget(self.save_settings_btn, 4, 0, 1, 2)
+
+        self.save_settings_btn.clicked.connect(self.save_settings)
+
+        settings_group.setLayout(settings_layout)
+        main_layout.addWidget(settings_group)
+
+        # Faults List (Detailed)
+        faults_group = QGroupBox("Active Faults")
+        faults_layout = QVBoxLayout()
+        self.faults_list = QListWidget()
+        faults_layout.addWidget(self.faults_list)
+        faults_group.setLayout(faults_layout)
+        main_layout.addWidget(faults_group)
+
+        # Set main layout
+        container = QWidget()
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
+
+    def update_data(self, data):
+        address = data.get('address', 'Unknown').strip()
+        logging.debug(f"Processing data for address: '{address}'")
+
+        if address == 'Unknown':
+            logging.warning("Received data with unknown address.")
+            return
+
+        # Add to slave selector if new
+        if address not in [self.slave_selector.item(i).text() for i in range(self.slave_selector.count())]:
+            self.slave_selector.addItem(address)
+            self.slaves_label.setText(f"Slaves Detected: {self.slave_selector.count()}")
+            logging.info(f"Slave {address} added to the selector.")
+
+        # Initialize data storage if not present
+        if address not in self.graph_data:
+            self.graph_data[address] = {
+                'time': [],
+                'Voltage': [],
+                'Current': [],
+                'SoC': [],
+                'Temp': [],
+                'Vcc': [],
+                'Balance Current': [],
+                'Terminal Voltage': [],
+                'Faults Reg': []
+            }
+            logging.debug(f"Initialized graph data for {address}.")
+
+        # Record start time if recording and first data point
+        if self.recording and not self.start_time:
+            self.start_time = time.time()
+            self.reset_plot()
+
+        if self.recording and self.start_time:
+            elapsed_time = time.time() - self.start_time
+        else:
+            elapsed_time = len(self.graph_data[address]['time']) * 0.5  # Assuming 0.5 sec interval
+
+        self.graph_data[address]['time'].append(elapsed_time)
+
+        # Append data
+        try:
+            voltage_str = data.get('Voltage', '0').replace(' V', '')
+            voltage = float(voltage_str) if voltage_str else 0.0
+            self.graph_data[address]['Voltage'].append(voltage)
+
+            current_str = data.get('Current', '0').replace(' A', '')
+            current = float(current_str) if current_str else 0.0
+            self.graph_data[address]['Current'].append(current)
+
+            soc_str = data.get('SoC', '0').replace(' %', '')
+            soc = float(soc_str) if soc_str else 0.0
+            self.graph_data[address]['SoC'].append(soc)
+
+            temp_str = data.get('Temp', '0').replace(' C', '')
+            temp = float(temp_str) if temp_str else 0.0
+            self.graph_data[address]['Temp'].append(temp)
+
+            vcc_str = data.get('Vcc', '0').replace(' V', '')
+            vcc = float(vcc_str) if vcc_str else 0.0
+            self.graph_data[address]['Vcc'].append(vcc)
+
+            bal_current_str = data.get('Balance Current', '0').replace(' A', '')
+            bal_current = float(bal_current_str) if bal_current_str else 0.0
+            self.graph_data[address]['Balance Current'].append(bal_current)
+
+            ter_voltage_str = data.get('Terminal Voltage', '0').replace(' V', '')
+            ter_voltage = float(ter_voltage_str) if ter_voltage_str else 0.0
+            self.graph_data[address]['Terminal Voltage'].append(ter_voltage)
+
+            faults_reg = data.get('Faults Reg', '0')
+            self.graph_data[address]['Faults Reg'].append(faults_reg)
+
+            # Update Faults List if this is a selected slave
+            selected_slaves = [item.text() for item in self.slave_selector.selectedItems()]
+            if address in selected_slaves:
+                self.update_faults_list(address, faults_reg)
+
+            # Save to CSV if recording
+            if self.recording and self.csv_path:
+                if address not in self.csv_files:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    csv_file_path = os.path.join(self.csv_path, f"Data_{timestamp}_{address}.csv")
+                    csv_file = open(csv_file_path, 'w', newline='')
+                    writer = csv.writer(csv_file)
+                    headers = ['Elapsed Time (s)', 'Voltage (V)', 'Current (A)', 'SoC (%)',
+                               'Temp (C)', 'Vcc (V)', 'Balance Current (A)', 'Terminal Voltage (V)', 'Faults Reg']
+                    writer.writerow(headers)
+                    self.csv_files[address] = csv_file
+                    self.csv_writer[address] = writer
+                    logging.debug(f"Created CSV file for {address} at {csv_file_path}")
+                # Write data row
+                row = [
+                    f"{elapsed_time:.2f}",
+                    voltage,
+                    current,
+                    soc,
+                    temp,
+                    vcc,
+                    bal_current,
+                    ter_voltage,
+                    faults_reg
+                ]
+                self.csv_writer[address].writerow(row)
+                logging.debug(f"Written data to CSV for {address}: {row}")
+
+            # Update graph if parameters are selected
+            if any([self.param_voltage.isChecked(), self.param_current.isChecked(),
+                    self.param_soc.isChecked(), self.param_temp.isChecked(),
+                    self.param_vcc.isChecked(), self.param_bal_current.isChecked(),
+                    self.param_ter_voltage.isChecked(), self.param_faults.isChecked()]):
+                self.update_graph_plot()
+
+        except Exception as e:
+            self.communicator.fault_updated.emit(f"Data Parsing Error: {str(e)}")
+
+    def handle_slave_detected(self, address):
+        if address not in [self.slave_selector.item(i).text() for i in range(self.slave_selector.count())]:
+            self.slave_selector.addItem(address)
+            self.slaves_label.setText(f"Slaves Detected: {self.slave_selector.count()}")
+            logging.info(f"Slave {address} added to the selector.")
+
+    def handle_slave_lost(self, address):
+        index = self.slave_selector.findItems(address, Qt.MatchExactly)
+        if index:
+            for item in index:
+                row = self.slave_selector.row(item)
+                self.slave_selector.takeItem(row)
+            self.slaves_label.setText(f"Slaves Detected: {self.slave_selector.count()}")
+            logging.info(f"Slave {address} removed from the selector and data.")
+            # Remove data from graph_data
+            if address in self.graph_data:
+                del self.graph_data[address]
+            # Clear faults list
+            self.faults_list.clear()
+            # Redraw graph
+            self.update_graph_plot()
+
+    def update_fault_label(self, fault):
+        if fault == "0" or fault == "00000000":
+            self.fault_label.setText("Faults: None")
+        else:
+            self.fault_label.setText(f"Faults: {fault}")
+
+    def on_slave_selected(self):
+        self.update_graph_plot()
+
+    def update_graph_plot(self):
+        self.canvas.axes.cla()  # Clear the canvas
+        selected_slaves = [item.text() for item in self.slave_selector.selectedItems()]
+        if not selected_slaves:
+            self.canvas.draw()
+            return
+
+        for address in selected_slaves:
+            data = self.graph_data.get(address, {})
+            time_data = data.get('time', [])
+            if not time_data:
+                continue
+
+            # Plot selected parameters
+            if self.param_voltage.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Voltage', []), label=f"{address} Voltage (V)")
+            if self.param_current.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Current', []), label=f"{address} Current (A)")
+            if self.param_soc.isChecked():
+                self.canvas.axes.plot(time_data, data.get('SoC', []), label=f"{address} SoC (%)")
+            if self.param_temp.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Temp', []), label=f"{address} Temperature (°C)")
+            if self.param_vcc.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Vcc', []), label=f"{address} Vcc (V)")
+            if self.param_bal_current.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Balance Current', []), label=f"{address} Balance Current (A)")
+            if self.param_ter_voltage.isChecked():
+                self.canvas.axes.plot(time_data, data.get('Terminal Voltage', []), label=f"{address} Terminal Voltage (V)")
+            if self.param_faults.isChecked():
+                # Plot Faults Reg as integer values
+                try:
+                    faults = [int(f, 2) for f in data.get('Faults Reg', ['0'])]
+                    self.canvas.axes.plot(time_data, faults, label=f"{address} Faults Reg", marker='o')
+                except ValueError:
+                    logging.error(f"Invalid Faults Reg format for {address}: {data.get('Faults Reg', '0')}")
+
+        self.canvas.axes.set_xlabel("Time (s)")
+        self.canvas.axes.set_ylabel("")
+        self.canvas.axes.legend()
+        self.canvas.fig.autofmt_xdate()
+        self.canvas.draw()
+
+    def update_faults_list(self, address, faults_reg):
+        self.faults_list.clear()
+        if faults_reg == '0' or faults_reg == '00000000':
+            self.faults_list.addItem("No faults")
+            return
+        # Convert binary string to integer
+        try:
+            faults_int = int(faults_reg, 2)
+        except ValueError:
+            faults_int = 0
+
+        for bit in range(8):
+            if faults_int & (1 << bit):
+                fault = FAULT_BITS.get(bit, f"Fault {bit}")
+                self.faults_list.addItem(fault)
+
+    def set_battery(self):
+        selected_slaves = [item.text() for item in self.slave_selector.selectedItems()]
+        if not selected_slaves:
+            QMessageBox.warning(self, "No Slave Selected", "Please select at least one slave to set battery parameters.")
+            return
+        for address in selected_slaves:
+            command = f"C {address} BatteryParameters"
+            self.serial_thread.send_command(command)
+            logging.info(f"Set Battery command sent to {address}.")
+
+    def set_protection(self):
+        selected_slaves = [item.text() for item in self.slave_selector.selectedItems()]
+        if not selected_slaves:
+            QMessageBox.warning(self, "No Slave Selected", "Please select at least one slave to set protection parameters.")
+            return
+        for address in selected_slaves:
+            command = f"Q {address} ProtectionParameters"
+            self.serial_thread.send_command(command)
+            logging.info(f"Set Protection command sent to {address}.")
+
+    def set_switching(self):
+        selected_slaves = [item.text() for item in self.slave_selector.selectedItems()]
+        if not selected_slaves:
+            QMessageBox.warning(self, "No Slave Selected", "Please select at least one slave to set switching pattern.")
+            return
+        for address in selected_slaves:
+            command = f"S {address} SwitchingPattern"
+            self.serial_thread.send_command(command)
+            logging.info(f"Set Switching command sent to {address}.")
+
+    def start_recording(self):
+        if self.recording:
+            QMessageBox.warning(self, "Already Recording", "Recording is already in progress.")
+            return
+        # Select directory to save CSV files
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory to Save CSV Files")
+        if not directory:
+            QMessageBox.warning(self, "No Directory Selected", "Please select a directory to save CSV files.")
+            return
+        self.csv_path = directory
+        self.recording = True
+        self.start_record_btn.setEnabled(False)
+        self.stop_record_btn.setEnabled(True)
+        self.start_time = time.time()
+        self.reset_plot()
+        QMessageBox.information(self, "Recording Started", f"Recording started. CSV files will be saved to {directory}.")
+        logging.info(f"Recording started. CSV path: {directory}")
+
+    def stop_recording(self):
+        if not self.recording:
+            QMessageBox.warning(self, "Not Recording", "Recording is not in progress.")
+            return
+        self.recording = False
+        self.start_record_btn.setEnabled(True)
+        self.stop_record_btn.setEnabled(False)
+        # Close all CSV files
+        for address, csv_file in self.csv_files.items():
+            csv_file.close()
+            logging.debug(f"Closed CSV file for {address}")
+        self.csv_files.clear()
+        self.csv_writer.clear()
+        self.start_time = None
+        QMessageBox.information(self, "Recording Stopped", "Recording has been stopped and CSV files are saved.")
+        logging.info("Recording stopped.")
+
+    def save_settings(self):
+        # Retrieve settings from input fields
+        address_assign = self.address_assign_input.text()
+        data_collect = self.data_collect_input.text()
+        slave_timeout = self.slave_timeout_input.text()
+        max_slaves = self.max_slaves_input.text()
+
+        # Validate inputs
+        try:
+            address_assign = int(address_assign)
+            data_collect = int(data_collect)
+            slave_timeout = int(slave_timeout)
+            max_slaves = int(max_slaves)
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Please enter valid integer values for settings.")
+            return
+
+        # Send settings to master via serial
+        settings_command = f"SETTINGS {address_assign} {data_collect} {slave_timeout} {max_slaves}"
+        self.serial_thread.send_command(settings_command)
+        QMessageBox.information(self, "Settings Saved", "Settings have been sent to the master.")
+        logging.info("Settings command sent to master.")
+
+    def check_slave_timeouts(self):
+        current_time = time.time()
+        timeout_sec = SLAVE_TIMEOUT_MS / 1000.0
+        for address, last_seen in list(self.serial_thread.slave_last_seen.items()):
+            if (current_time - last_seen) > timeout_sec:
+                self.serial_thread.slave_last_seen.pop(address)
+                self.communicator.slave_lost.emit(address)
+
+    def reset_plot(self):
+        self.graph_data = {}
+        self.canvas.axes.cla()
+        self.canvas.draw()
+        logging.debug("Plot reset.")
+
+    def closeEvent(self, event):
+        # Clean up the serial thread
+        self.serial_thread.stop()
+        self.serial_thread.join()
+        self.serial_port.close()
+        # Close any open CSV files
+        for address, csv_file in self.csv_files.items():
+            csv_file.close()
+            logging.debug(f"Closed CSV file for {address}")
+        event.accept()
+
+# Main function
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
