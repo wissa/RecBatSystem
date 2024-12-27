@@ -1,0 +1,499 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import serial.tools.list_ports
+
+import matplotlib
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+matplotlib.use("TkAgg")
+
+
+class BmsApplication(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # -------------------------------
+        #   Main Window Title & Size
+        # -------------------------------
+        self.title("Multi-Battery System Data Control - 2025 (V1)")
+        self.geometry("1200x700")  # Starting size; user can still resize/maximize.
+
+        # -------------------------------
+        #   Global Font Adjustments
+        # -------------------------------
+        # Increase default font size a bit
+        self.option_add("*Font", ("TkDefaultFont", 11))
+
+        # Create a style to make certain headings bold
+        style = ttk.Style(self)
+        style.configure("Bold.TLabel", font=("TkDefaultFont", 11, "bold"))
+        style.configure("Bold.TLabelframe.Label", font=("TkDefaultFont", 11, "bold"))
+
+        # -------------------------------
+        #   Grid Configuration (4 rows)
+        # -------------------------------
+        # Row 0: Top Title + 4 frames (Master, Slave, Battery, Switching)
+        # Row 1: (Empty or just a spacer)
+        # Row 2: Plot area
+        # Row 3: Bottom (Faults, Status, Buttons)
+        self.columnconfigure(0, weight=1)   # Only one column in the root
+        for r in range(4):
+            self.rowconfigure(r, weight=0)
+        self.rowconfigure(2, weight=1)  # The plot row expands the most
+
+        # 1) Create top container (row=0), in which we place:
+        #    - A bold label "Multi-Battery System Data Control"
+        #    - A horizontal frame for the 4 labeled sub-frames.
+        self._create_top_section()
+
+        # 2) Create an (optional) spacer row or just proceed
+        #    For neatness, we place an empty row=1 with zero height,
+        #    or we can skip it. Let's skip a dedicated spacer.
+
+        # 3) Middle row (row=2) for the plot
+        self._create_plot_section()
+
+        # 4) Bottom row (row=3) for faults, status, etc.
+        self._create_bottom_section()
+
+        # Periodic refresh for the plot (demo)
+        self._update_plot()
+
+    # -----------------------------------------------------
+    #   TOP SECTION
+    #   Includes a big bold title + (Master, Slave, Batt, Switch)
+    # -----------------------------------------------------
+    def _create_top_section(self):
+        top_frame = ttk.Frame(self)
+        top_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+
+        # Title label
+        title_label = ttk.Label(
+            top_frame,
+            text="Multi-Battery System Data Control",
+            style="Bold.TLabel"
+        )
+        title_label.pack(side=tk.TOP, pady=(0, 5))
+
+        # Now a sub-frame that holds the four labeled frames horizontally
+        top_subframe = ttk.Frame(top_frame)
+        top_subframe.pack(fill=tk.X, expand=True)
+
+        top_subframe.columnconfigure(0, weight=0)
+        top_subframe.columnconfigure(1, weight=0)
+        top_subframe.columnconfigure(2, weight=0)
+        top_subframe.columnconfigure(3, weight=1)
+
+        # Master Settings
+        self.master_settings_frame = ttk.Labelframe(top_subframe, text="Master Settings", style="Bold.TLabelframe")
+        self.master_settings_frame.grid(row=0, column=0, padx=5, pady=5, sticky="n")
+
+        # Slave List
+        self.slave_list_frame = ttk.Labelframe(top_subframe, text="Slave List", style="Bold.TLabelframe")
+        self.slave_list_frame.grid(row=0, column=1, padx=5, pady=5, sticky="n")
+
+        # Battery & Protection
+        self.battery_frame = ttk.Labelframe(top_subframe, text="Battery & Protection", style="Bold.TLabelframe")
+        self.battery_frame.grid(row=0, column=2, padx=5, pady=5, sticky="n")
+
+        # Switching Pattern
+        self.switching_frame = ttk.Labelframe(top_subframe, text="Switching Pattern", style="Bold.TLabelframe")
+        self.switching_frame.grid(row=0, column=3, padx=5, pady=5, sticky="nsew")
+
+        # Fill in each labeled frame
+        self._create_master_settings(self.master_settings_frame)
+        self._create_slave_list(self.slave_list_frame)
+        self._create_battery_protection_settings(self.battery_frame)
+        self._create_switching_pattern_section(self.switching_frame)
+
+    # -----------------------------------------------------
+    #   MASTER SETTINGS
+    # -----------------------------------------------------
+    def _create_master_settings(self, parent):
+        # Use a small grid inside the label frame
+        ttk.Label(parent, text="COM Port:").grid(row=0, column=0, sticky=tk.W, padx=2, pady=2)
+        self.com_port_var = tk.StringVar()
+        self.com_port_dropdown = ttk.Combobox(parent, textvariable=self.com_port_var)
+        self.com_port_dropdown.grid(row=0, column=1, sticky=tk.W, padx=2, pady=2)
+
+        # Populate with active COM ports
+        port_list = [p.device for p in serial.tools.list_ports.comports()]
+        self.com_port_dropdown["values"] = port_list
+        if port_list:
+            self.com_port_dropdown.current(0)
+
+        ttk.Label(parent, text="Baud Rate:").grid(row=1, column=0, sticky=tk.W, padx=2, pady=2)
+        self.baud_rate_var = tk.StringVar(value="115200")
+        self.baud_rate_dropdown = ttk.Combobox(
+            parent,
+            textvariable=self.baud_rate_var,
+            values=["4800","9600","19200","38400","57600","115200","230400"]
+        )
+        self.baud_rate_dropdown.grid(row=1, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Data Intv (ms):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=2)
+        self.data_interval_var = tk.StringVar(value="1000")
+        ttk.Entry(parent, textvariable=self.data_interval_var).grid(row=2, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Slave TO (ms):").grid(row=3, column=0, sticky=tk.W, padx=2, pady=2)
+        self.slave_timeout_var = tk.StringVar(value="500")
+        ttk.Entry(parent, textvariable=self.slave_timeout_var).grid(row=3, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Addr. (ms):").grid(row=4, column=0, sticky=tk.W, padx=2, pady=2)
+        self.address_assign_var = tk.StringVar(value="100")
+        ttk.Entry(parent, textvariable=self.address_assign_var).grid(row=4, column=1, sticky=tk.W, padx=2, pady=2)
+
+        # Connect & Disconnect
+        button_frame = ttk.Frame(parent)
+        button_frame.grid(row=5, column=0, columnspan=2, pady=(5,0))
+
+        self.connect_button = ttk.Button(button_frame, text="Connect", command=self._on_connect)
+        self.connect_button.pack(side=tk.LEFT, padx=2)
+
+        self.disconnect_button = ttk.Button(button_frame, text="Disconnect", command=self._on_disconnect)
+        self.disconnect_button.pack(side=tk.LEFT, padx=2)
+
+        # SAVE
+        self.save_master_button = ttk.Button(parent, text="SAVE", command=self._on_save_master_settings)
+        self.save_master_button.grid(row=6, column=0, columnspan=2, pady=(5,5))
+
+    # -----------------------------------------------------
+    #   SLAVE LIST
+    # -----------------------------------------------------
+    def _create_slave_list(self, parent):
+        self.slave_listbox = tk.Listbox(parent, selectmode=tk.EXTENDED, height=5)
+        self.slave_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.slave_listbox.yview)
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=5)
+        self.slave_listbox.config(yscrollcommand=scrollbar.set)
+
+        # Dummy data
+        for i in range(1, 6):
+            self.slave_listbox.insert(tk.END, f"Slave #{i}")
+
+    # -----------------------------------------------------
+    #   BATTERY & PROTECTION
+    # -----------------------------------------------------
+    def _create_battery_protection_settings(self, parent):
+        # We'll do a small grid layout
+        ttk.Label(parent, text="Battery Type:").grid(row=0, column=0, sticky=tk.W, padx=2, pady=2)
+        self.battery_type_var = tk.StringVar(value="Li-ion")
+        battery_combo = ttk.Combobox(parent, textvariable=self.battery_type_var, values=["Li-ion","LFP"])
+        battery_combo.grid(row=0, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="100% SoC (V):").grid(row=1, column=0, sticky=tk.W, padx=2, pady=2)
+        self.soc_100_var = tk.StringVar(value="4.2")
+        ttk.Entry(parent, textvariable=self.soc_100_var).grid(row=1, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="0% SoC (V):").grid(row=2, column=0, sticky=tk.W, padx=2, pady=2)
+        self.soc_0_var = tk.StringVar(value="3.0")
+        ttk.Entry(parent, textvariable=self.soc_0_var).grid(row=2, column=1, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Max I_ch (A):").grid(row=3, column=0, sticky=tk.W, padx=2, pady=2)
+        self.max_ch_var = tk.StringVar(value="5.0")
+        ttk.Entry(parent, textvariable=self.max_ch_var).grid(row=3, column=1, sticky=tk.W, padx=2, pady=2)
+
+        # Next column
+        ttk.Label(parent, text="Max I_ds (A):").grid(row=0, column=2, sticky=tk.W, padx=2, pady=2)
+        self.max_ds_var = tk.StringVar(value="5.0")
+        ttk.Entry(parent, textvariable=self.max_ds_var).grid(row=0, column=3, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Chg Cut-off (V):").grid(row=1, column=2, sticky=tk.W, padx=2, pady=2)
+        self.charge_cutoff_var = tk.StringVar(value="4.2")
+        ttk.Entry(parent, textvariable=self.charge_cutoff_var).grid(row=1, column=3, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Dsch Cut-off (V):").grid(row=2, column=2, sticky=tk.W, padx=2, pady=2)
+        self.discharge_cutoff_var = tk.StringVar(value="3.0")
+        ttk.Entry(parent, textvariable=self.discharge_cutoff_var).grid(row=2, column=3, sticky=tk.W, padx=2, pady=2)
+
+        ttk.Label(parent, text="Over Temp (°C):").grid(row=3, column=2, sticky=tk.W, padx=2, pady=2)
+        self.over_temp_var = tk.StringVar(value="60")
+        ttk.Entry(parent, textvariable=self.over_temp_var).grid(row=3, column=3, sticky=tk.W, padx=2, pady=2)
+
+        # GET / SET
+        get_btn = ttk.Button(parent, text="GET", command=self._on_get_settings)
+        get_btn.grid(row=4, column=2, sticky=tk.E, padx=2, pady=5)
+
+        set_btn = ttk.Button(parent, text="SET", command=self._on_set_settings)
+        set_btn.grid(row=4, column=3, sticky=tk.W, padx=2, pady=5)
+
+    # -----------------------------------------------------
+    #   SWITCHING PATTERN (top-right)
+    # -----------------------------------------------------
+    def _create_switching_pattern_section(self, parent):
+        # We'll do a simple vertical arrangement
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.pattern_listbox = tk.Listbox(list_frame, height=5)
+        self.pattern_listbox.pack(side=tk.LEFT, fill=tk.Y)
+
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.pattern_listbox.yview)
+        sb.pack(side=tk.LEFT, fill=tk.Y)
+        self.pattern_listbox.config(yscrollcommand=sb.set)
+
+        # Buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(side=tk.TOP, padx=5, pady=5)
+
+        add_button = ttk.Button(btn_frame, text="ADD", command=self._on_add_pattern)
+        add_button.grid(row=0, column=0, padx=2, pady=2)
+
+        del_button = ttk.Button(btn_frame, text="DEL", command=self._on_del_pattern)
+        del_button.grid(row=0, column=1, padx=2, pady=2)
+
+        up_button = ttk.Button(btn_frame, text="UP", command=self._on_up_pattern)
+        up_button.grid(row=0, column=2, padx=2, pady=2)
+
+        down_button = ttk.Button(btn_frame, text="DOWN", command=self._on_down_pattern)
+        down_button.grid(row=0, column=3, padx=2, pady=2)
+
+        set_button = ttk.Button(btn_frame, text="SET", command=self._on_set_pattern)
+        set_button.grid(row=0, column=4, padx=2, pady=2)
+
+        # Edit row
+        edit_frame = ttk.Frame(parent)
+        edit_frame.pack(side=tk.TOP, padx=5, pady=5)
+
+        ttk.Label(edit_frame, text="Edit:").grid(row=0, column=0, sticky=tk.E, padx=2)
+        self.pattern_edit_var = tk.StringVar()
+        self.pattern_edit_entry = ttk.Entry(edit_frame, textvariable=self.pattern_edit_var, width=20)
+        self.pattern_edit_entry.grid(row=0, column=1, padx=2)
+
+        update_btn = ttk.Button(edit_frame, text="Update", command=self._on_update_pattern)
+        update_btn.grid(row=0, column=2, padx=5)
+
+    # --------------------------------------------------
+    #   MIDDLE SECTION: PLOT (row=2)
+    # --------------------------------------------------
+    def _create_plot_section(self):
+        # Put the entire plot area in row=2
+        self.plot_frame = ttk.Frame(self)
+        self.plot_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+
+        # We want the plot frame to expand, so:
+        self.plot_frame.columnconfigure(0, weight=1)
+        self.plot_frame.rowconfigure(1, weight=1)  # row=1 for the actual plot
+
+        # ========== Checkboxes row (row=0) ==========
+        checkbox_frame = ttk.LabelFrame(self.plot_frame, text="Data to Plot", style="Bold.TLabelframe")
+        checkbox_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+
+        self.data_var_vbat = tk.BooleanVar(value=True)
+        self.data_var_ibat = tk.BooleanVar(value=False)
+        self.data_var_soc  = tk.BooleanVar(value=False)
+        self.data_var_temp = tk.BooleanVar(value=False)
+        self.data_var_vter = tk.BooleanVar(value=False)
+        self.data_var_ibal = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(checkbox_frame, text="VBat (V)", variable=self.data_var_vbat).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(checkbox_frame, text="IBat (V)", variable=self.data_var_ibat).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(checkbox_frame, text="SoC (%)",  variable=self.data_var_soc ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(checkbox_frame, text="T (°C)",   variable=self.data_var_temp).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(checkbox_frame, text="VTer (V)", variable=self.data_var_vter).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(checkbox_frame, text="IBAL (A)", variable=self.data_var_ibal).pack(side=tk.LEFT, padx=5)
+
+        # ========== Plot area (row=1) ==========
+        plot_area = ttk.Frame(self.plot_frame)
+        plot_area.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+
+        plot_area.columnconfigure(0, weight=1)
+        plot_area.rowconfigure(0, weight=1)
+
+        self.fig = Figure(figsize=(5, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Real-time Data")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Value")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_area)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        # ========== Recording Controls (row=2) ==========
+        record_frame = ttk.Frame(self.plot_frame)
+        record_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+
+        self.record_button = ttk.Button(record_frame, text="Start Recording", command=self._on_start_recording)
+        self.record_button.pack(side=tk.LEFT, padx=5)
+
+        self.stop_button = ttk.Button(record_frame, text="Stop Recording", command=self._on_stop_recording)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        self.reset_button = ttk.Button(record_frame, text="Reset", command=self._on_reset_plot)
+        self.reset_button.pack(side=tk.LEFT, padx=5)
+
+    # --------------------------------------------------
+    #   BOTTOM SECTION (row=3)
+    # --------------------------------------------------
+    def _create_bottom_section(self):
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+
+        # We'll horizontally pack Faults, Status, and App Buttons
+        faults_frame = ttk.LabelFrame(bottom_frame, text="Faults Reports", style="Bold.TLabelframe")
+        faults_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+
+        self.faults_text = tk.Text(faults_frame, height=5, width=40)
+        self.faults_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        faults_scrollbar = ttk.Scrollbar(faults_frame, orient=tk.VERTICAL, command=self.faults_text.yview)
+        faults_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.faults_text.config(yscrollcommand=faults_scrollbar.set)
+
+        # Status
+        status_frame = ttk.LabelFrame(bottom_frame, text="Status Indicators", style="Bold.TLabelframe")
+        status_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+
+        ttk.Label(status_frame, text="Master Comm:", style="Bold.TLabel").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.comm_status_label = ttk.Label(status_frame, text="Disconnected", foreground="red")
+        self.comm_status_label.grid(row=0, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(status_frame, text="Fault Status:", style="Bold.TLabel").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.fault_status_label = ttk.Label(status_frame, text="No Fault", foreground="green")
+        self.fault_status_label.grid(row=1, column=1, sticky=tk.W, pady=3)
+
+        ttk.Label(status_frame, text="Recording:", style="Bold.TLabel").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.record_status_label = ttk.Label(status_frame, text="Stopped", foreground="red")
+        self.record_status_label.grid(row=2, column=1, sticky=tk.W, pady=3)
+
+        # ABOUT / HELP / EXIT
+        app_buttons_frame = ttk.Frame(bottom_frame)
+        app_buttons_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+
+        about_button = ttk.Button(app_buttons_frame, text="ABOUT", command=self._show_about)
+        about_button.pack(pady=2, fill=tk.X)
+
+        help_button = ttk.Button(app_buttons_frame, text="HELP", command=self._show_help)
+        help_button.pack(pady=2, fill=tk.X)
+
+        exit_button = ttk.Button(app_buttons_frame, text="EXIT", command=self._exit_app)
+        exit_button.pack(pady=2, fill=tk.X)
+
+    # --------------------------------------------------
+    #   CALLBACKS & PLACEHOLDERS
+    # --------------------------------------------------
+    def _on_connect(self):
+        """Placeholder for connecting to hardware via serial port."""
+        com = self.com_port_var.get()
+        baud = self.baud_rate_var.get()
+        if com and baud:
+            self.comm_status_label.config(text="Connected", foreground="green")
+            messagebox.showinfo("Connect", f"Attempt to connect on {com} at {baud} baud.")
+        else:
+            messagebox.showwarning("Warning", "Please select a COM port and baud rate.")
+
+    def _on_disconnect(self):
+        """Placeholder for disconnecting from hardware."""
+        # In a real application, close the serial port here.
+        self.comm_status_label.config(text="Disconnected", foreground="red")
+        messagebox.showinfo("Disconnect", "Disconnected from hardware (placeholder).")
+
+    def _on_save_master_settings(self):
+        data_intv = self.data_interval_var.get()
+        slave_to  = self.slave_timeout_var.get()
+        addr_intv = self.address_assign_var.get()
+        messagebox.showinfo(
+            "Save Master Settings",
+            f"Data Interval: {data_intv} ms\n"
+            f"Slave Timeout: {slave_to} ms\n"
+            f"Address Assign: {addr_intv} ms\n\n"
+            "Settings saved! (Placeholder)"
+        )
+
+    def _on_get_settings(self):
+        messagebox.showinfo("GET Settings", "Retrieve settings from hardware (not implemented).")
+
+    def _on_set_settings(self):
+        messagebox.showinfo("SET Settings", "Apply settings to hardware (not implemented).")
+
+    # Recording
+    def _on_start_recording(self):
+        self.record_status_label.config(text="Recording", foreground="green")
+        self.csv_file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv")],
+            title="Save Recording"
+        )
+        # Start logging data...
+
+    def _on_stop_recording(self):
+        self.record_status_label.config(text="Stopped", foreground="red")
+        # Stop logging data...
+
+    def _on_reset_plot(self):
+        self.ax.clear()
+        self.ax.set_title("Real-time Data")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Value")
+        self.canvas.draw()
+
+    # Switching Pattern
+    def _on_add_pattern(self):
+        self.pattern_listbox.insert(tk.END, "New Pattern")
+
+    def _on_del_pattern(self):
+        selection = self.pattern_listbox.curselection()
+        if selection:
+            self.pattern_listbox.delete(selection[0])
+
+    def _on_up_pattern(self):
+        selection = self.pattern_listbox.curselection()
+        if selection and selection[0] > 0:
+            idx = selection[0]
+            text = self.pattern_listbox.get(idx)
+            self.pattern_listbox.delete(idx)
+            self.pattern_listbox.insert(idx - 1, text)
+            self.pattern_listbox.selection_set(idx - 1)
+
+    def _on_down_pattern(self):
+        selection = self.pattern_listbox.curselection()
+        if selection and selection[0] < self.pattern_listbox.size() - 1:
+            idx = selection[0]
+            text = self.pattern_listbox.get(idx)
+            self.pattern_listbox.delete(idx)
+            self.pattern_listbox.insert(idx + 1, text)
+            self.pattern_listbox.selection_set(idx + 1)
+
+    def _on_set_pattern(self):
+        messagebox.showinfo("Switching Pattern", "Send pattern to hardware (not implemented).")
+
+    def _on_update_pattern(self):
+        selection = self.pattern_listbox.curselection()
+        new_text = self.pattern_edit_var.get().strip()
+        if selection and new_text:
+            idx = selection[0]
+            self.pattern_listbox.delete(idx)
+            self.pattern_listbox.insert(idx, new_text)
+            self.pattern_listbox.selection_set(idx)
+
+    # ABOUT / HELP / EXIT
+    def _show_about(self):
+        messagebox.showinfo(
+            "ABOUT",
+            "Developed by Walid Issa\nYear 2025\nVersion V1"
+        )
+
+    def _show_help(self):
+        messagebox.showinfo("HELP", "Opening Help.pdf (not implemented).")
+        # For Windows:
+        # import os
+        # os.startfile("Help.pdf")
+        # Or cross-platform:
+        # import subprocess
+        # subprocess.run(["xdg-open", "Help.pdf"])
+
+    def _exit_app(self):
+        self.destroy()
+
+    # Plot Update (demo)
+    def _update_plot(self):
+        """Placeholder for reading data and updating the plot periodically."""
+        self.canvas.draw()
+        self.after(500, self._update_plot)
+
+
+if __name__ == "__main__":
+    app = BmsApplication()
+    app.mainloop()
