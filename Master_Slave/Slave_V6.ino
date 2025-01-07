@@ -72,7 +72,7 @@ struct ProtectionConfig {
   float OverTemp;
 } ProtConfig;
 
-#define MAX_PATTERNS 10
+#define MAX_PATTERNS 16
 
 struct Switch_Config {
   uint8_t SW_Config[MAX_PATTERNS];
@@ -232,9 +232,12 @@ void onI2CReceive(int numBytes) {
       } else {
         MySW_Config.SW_Config[i] = 0xFF;
       }
+    }
+    for (int i = 0; i < MAX_PATTERNS; i++) {
       EEPROM.put(SW_ADDR + i, MySW_Config.SW_Config[i]);
       if (MySW_Config.SW_Config[i] == 0xFF) { break; }
     }
+
     // Update PORTB immediately
     PORTB = MySW_Config.SW_Config[0];
     lastCommand = 0;
@@ -502,8 +505,74 @@ float calculateVoltage(float measuredVoltage, float dividerGain) {
 
 // Self Calibration Function (Unused in Current Context)
 void selfCalibrate(int channel) {
-  // Implementation remains unchanged or can be adapted as needed
+  while(Serial.available() > 0) { Serial.read(); }
+  Serial.print(F("Starting Self-Calibration for Channel "));
+  Serial.print(channel + 1);
+  Serial.println(F("..."));
+  Serial.println(F("Provide known values for calibration. 20 points required."));
+  
+  float arduinoValues[20];
+  float knownValues[20];
+  int dataIndex = 0;
+  
+  while (dataIndex < 20) {
+    Serial.print(F("Enter the known set-value: "));
+    while (!Serial.available());
+    char inputBuffer[10];
+    int len = Serial.readBytesUntil('\n', inputBuffer, sizeof(inputBuffer) - 1);
+    inputBuffer[len] = '\0';
+    float knownValue = atof(inputBuffer);
+    
+    if (!isnan(knownValue) && knownValue >= 0) {
+      int16_t raw = ads.readRaw(channel);
+      float voltage = ads.rawToVoltage(raw);
+      float arduinoValue;
+      
+      if (channel == 0) {
+        arduinoValue = calculateCurrent(voltage, TL431_VOLTAGE, NCS_GAIN, SHUNT_RESISTOR);
+      } else if (channel == 1) {
+        arduinoValue = calculateCurrent(voltage, 0.0f, NCS_GAIN, 0.05f);
+      } else {
+        arduinoValue = calculateVoltage(voltage, DIVIDER_RATIO);
+      }
+      
+      Serial.print(F("Point "));
+      Serial.print(dataIndex + 1);
+      Serial.print(F(": Arduino Value = "));
+      Serial.println(arduinoValue, 6);
+      
+      arduinoValues[dataIndex] = arduinoValue;
+      knownValues[dataIndex] = knownValue;
+      dataIndex++;
+    } else {
+      Serial.println(F("Invalid input. Try again."));
+    }
+  }
+  
+  // Linear Regression
+  float sumX = 0.0f, sumY = 0.0f, sumXY = 0.0f, sumX2 = 0.0f;
+  for(int i = 0; i < 20; i++) {
+    sumX += arduinoValues[i];
+    sumY += knownValues[i];
+    sumXY += arduinoValues[i] * knownValues[i];
+    sumX2 += arduinoValues[i] * arduinoValues[i];
+  }
+  
+  calibrationSlope[channel] = (20.0f * sumXY - sumX * sumY) / (20.0f * sumX2 - sumX * sumX);
+  calibrationOffset[channel] = (sumY - calibrationSlope[channel] * sumX) / 20.0f;
+  
+  EEPROM.put(EEPROM_BASE_ADDR + channel * SLOPE_OFFSET_SIZE, calibrationSlope[channel]);
+  EEPROM.put(EEPROM_BASE_ADDR + channel * SLOPE_OFFSET_SIZE + 4, calibrationOffset[channel]);
+  
+  Serial.print(F("Calibration for Channel "));
+  Serial.print(channel + 1);
+  Serial.println(F(" Complete!"));
+  Serial.print(F("New Slope: "));
+  Serial.println(calibrationSlope[channel], 6);
+  Serial.print(F("New Offset: "));
+  Serial.println(calibrationOffset[channel], 6);
 }
+
 
 // Print Divider
 void printDivider() {
