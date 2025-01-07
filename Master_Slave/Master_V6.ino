@@ -517,7 +517,7 @@ void requestSlaveDataSingle(char command, uint8_t address) {
       Serial.print(F("A, I_dch="));   Serial.print(I_dch,2);
       Serial.print(F("A, OCVP="));    Serial.print(ocvp,2);
       Serial.print(F("V, ODVP="));    Serial.print(odvp,2);
-      Serial.print(F("V, I_Bal="));   Serial.print(iBal,2);
+      Serial.print(F("V, I_Bal="));   Serial.print(iBal,4);
       Serial.print(F("A, OverT="));   Serial.println(tMax,2);
     }
   }
