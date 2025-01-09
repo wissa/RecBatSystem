@@ -1,0 +1,1078 @@
+import tkinter as tk
+import tkinter.font
+from tkinter import ttk, messagebox, filedialog
+import serial
+import serial.tools.list_ports
+import threading
+import queue
+import time
+import csv
+import os
+import sys
+import re
+import pyperclip  # pip install pyperclip
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+########################################################################
+# Example named fault bits from your master code
+# We'll leave FAULT_NAMES here, though we are currently showing raw binary.
+FAULT_NAMES = {
+    0: "OverVoltage",
+    1: "UnderVoltage",
+    2: "OverTemp",
+    3: "UnderTemp",
+    4: "OverCurrent",
+    5: "Reserved5",
+    6: "Reserved6",
+    7: "Reserved7",
+}
+########################################################################
+
+
+class SerialThread(threading.Thread):
+    """
+    ### NEW OR MODIFIED ###
+    Reads from the serial port in a background thread,
+    accumulates bytes until we find a newline (\n),
+    then pushes the complete line to the queue.
+    This prevents partial lines, so each line is for exactly one slave.
+    """
+    def __init__(self, ser, output_queue, stop_event):
+        super().__init__()
+        self.ser = ser
+        self.output_queue = output_queue
+        self.stop_event = stop_event
+
+    def run(self):
+        buffer = b""
+        while not self.stop_event.is_set():
+            try:
+                if self.ser.in_waiting > 0:
+                    data = self.ser.read(self.ser.in_waiting)
+                    buffer += data
+                    # Split on newline
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if line:
+                            self.output_queue.put(("IN", line.decode("utf-8", errors="ignore")))
+                else:
+                    time.sleep(0.02)
+            except (serial.SerialException, OSError):
+                # Master physically disconnected or error
+                self.output_queue.put(("ERROR", "Master disconnected or reset"))
+                break
+
+
+class MultiBatteryGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Multi-Battery System Data Control")
+
+        # ------------------- Increase Font -------------------
+        self.default_font = tk.font.nametofont("TkDefaultFont")
+        self.default_font.configure(size=self.default_font.cget("size") + 2)
+
+        # 1) Connection status + LED color
+        self.connection_status_var = tk.StringVar(value="Master: Unknown")
+        self.conn_led_color = tk.StringVar(value="red")
+
+        # 2) Serial
+        self.ser = None
+        self.serial_thread = None
+        self.serial_stop_event = threading.Event()
+        self.serial_queue = queue.Queue()
+
+        # 3) Slaves set
+        self.slaves = set()
+
+        # 4) Data dictionary for each slave
+        #    We'll store time-based arrays for plotting.
+        self.data = {}  # data[addr] = { "time":[], "vbat":[], ... }
+
+        # 5) For CSV: last known data for each slave => one row per new event
+        self.last_data = {}
+        self.csv_slaves_order = []
+
+        # ### NEW OR MODIFIED ###
+        # For the fault list: one line per slave
+        self.slave_faults = {}  # { addr_int: binaryString }
+
+        # Start time (for the plot, not for CSV)
+        self.start_time = time.time()
+
+        # Logging
+        self.logging = False
+        self.logfile = None
+        self.csv_writer = None
+
+        # ### NEW OR MODIFIED ###
+        # We'll add log_start_time to start CSV from zero
+        self.log_start_time = None
+
+        # 8) Data rate
+        self.data_point_count = 0
+        self.last_rate_check = time.time()
+        self.data_rate_var = tk.StringVar(value="Data Rate: 0 dp/s")
+
+        # ### Heartbeat: track last master data time
+        self.last_master_data_time = time.time()
+
+        self._build_ui()
+
+        # Poll the queue
+        self.after(100, self._check_serial_queue)
+
+        # Data rate check
+        self.after(1000, self._check_data_rate)
+
+        # Heartbeat check every 2 seconds
+        self.after(2000, self._check_master_heartbeat)
+
+
+    def _build_ui(self):
+        """
+        Your entire UI code, unchanged except where we comment NEW / MODIFIED.
+        """
+        top_frame = ttk.Frame(self)
+        top_frame.pack(side=tk.TOP, fill=tk.X, expand=False)
+
+        # =========== Master Settings ===============
+        frame_master = ttk.LabelFrame(top_frame, text="Master Settings")
+        frame_master.pack(side=tk.LEFT, padx=5, pady=5)
+
+        ttk.Label(frame_master, text="COM Port:").grid(row=0, column=0, sticky="w")
+        self.combo_port = ttk.Combobox(frame_master, width=8)
+        self._populate_com_ports()
+        self.combo_port.grid(row=0, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_master, text="Baud:").grid(row=1, column=0, sticky="w")
+        self.combo_baud = ttk.Combobox(frame_master, width=8, values=[9600,19200,57600,115200,230400])
+        self.combo_baud.current(3)
+        self.combo_baud.grid(row=1, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_master, text="Data ms:").grid(row=2, column=0, sticky="w")
+        self.entry_data_coll = ttk.Entry(frame_master, width=8)
+        self.entry_data_coll.insert(0, "2000")
+        self.entry_data_coll.grid(row=2, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_master, text="Timeout:").grid(row=3, column=0, sticky="w")
+        self.entry_timeout = ttk.Entry(frame_master, width=8)
+        self.entry_timeout.insert(0, "15000")
+        self.entry_timeout.grid(row=3, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_master, text="AddrInt:").grid(row=4, column=0, sticky="w")
+        self.entry_addr_assign = ttk.Entry(frame_master, width=8)
+        self.entry_addr_assign.insert(0, "10000")
+        self.entry_addr_assign.grid(row=4, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_master, text="Freq(Hz):").grid(row=5, column=0, sticky="w")
+        self.entry_freq = ttk.Entry(frame_master, width=8)
+        self.entry_freq.insert(0, "20000")
+        self.entry_freq.grid(row=5, column=1, padx=2, pady=2)
+
+        self.btn_open = ttk.Button(frame_master, text="Open Port", command=self._open_port)
+        self.btn_open.grid(row=6, column=0, padx=2, pady=2)
+
+        self.btn_save_setting = ttk.Button(frame_master, text="SaveSet", command=self._save_setting)
+        self.btn_save_setting.grid(row=6, column=1, padx=2, pady=2)
+
+        ttk.Button(frame_master, text="SetFreq", command=self._set_freq).grid(row=7, column=0, columnspan=2, padx=2, pady=2)
+        ttk.Button(frame_master, text="SAVE", command=self._send_save).grid(row=8, column=0, padx=2, pady=2)
+        ttk.Button(frame_master, text="LOAD", command=self._send_load).grid(row=8, column=1, padx=2, pady=2)
+
+        # =========== Slaves & Faults ===============
+        frame_slaves_faults = ttk.LabelFrame(top_frame, text="Slaves & Faults")
+        frame_slaves_faults.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.list_slaves = tk.Listbox(frame_slaves_faults, selectmode=tk.MULTIPLE, width=10, height=8)
+        self.list_slaves.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=2)
+        sb_slv = ttk.Scrollbar(frame_slaves_faults, orient=tk.VERTICAL, command=self.list_slaves.yview)
+        sb_slv.pack(side=tk.LEFT, fill=tk.Y)
+        self.list_slaves.config(yscrollcommand=sb_slv.set)
+
+        fault_frame = ttk.Frame(frame_slaves_faults)
+        fault_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        led_frame = ttk.Frame(fault_frame)
+        led_frame.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(led_frame, text="Connection:").pack(side=tk.LEFT)
+        self.conn_led_canvas = tk.Canvas(led_frame, width=20, height=20)
+        self.conn_led_canvas.pack(side=tk.LEFT, padx=5)
+        self._update_conn_led()
+
+        lbl_conn_status = ttk.Label(led_frame, textvariable=self.connection_status_var, foreground="blue")
+        lbl_conn_status.pack(side=tk.LEFT, padx=5)
+
+        self.text_faults = tk.Text(fault_frame, width=40, height=8)
+        self.text_faults.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # =========== Slave Settings ===============
+        frame_slave_settings = ttk.LabelFrame(top_frame, text="Slave Settings")
+        frame_slave_settings.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Battery
+        frame_batt = ttk.LabelFrame(frame_slave_settings, text="Battery")
+        frame_batt.pack(side=tk.LEFT, padx=5, pady=5)
+
+        ttk.Label(frame_batt, text="Type:").grid(row=0, column=0, sticky="w")
+        self.combo_batt_type = ttk.Combobox(frame_batt, values=["1 (LFP)", "2 (LiPo)", "3 (NCM)"], width=8)
+        self.combo_batt_type.current(0)
+        self.combo_batt_type.grid(row=0, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_batt, text="100%SoC:").grid(row=1, column=0, sticky="w")
+        self.entry_fullv = ttk.Entry(frame_batt, width=8)
+        self.entry_fullv.insert(0, "3.60")
+        self.entry_fullv.grid(row=1, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_batt, text="0%SoC:").grid(row=2, column=0, sticky="w")
+        self.entry_emptyv = ttk.Entry(frame_batt, width=8)
+        self.entry_emptyv.insert(0, "2.50")
+        self.entry_emptyv.grid(row=2, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_batt, text="Cap(Ah):").grid(row=3, column=0, sticky="w")
+        self.entry_capacity = ttk.Entry(frame_batt, width=8)
+        self.entry_capacity.insert(0, "10")
+        self.entry_capacity.grid(row=3, column=1, padx=2, pady=2)
+
+        ttk.Button(frame_batt, text="GET", command=self._get_battery).grid(row=4, column=0, padx=2, pady=2)
+        ttk.Button(frame_batt, text="SET", command=self._set_battery).grid(row=4, column=1, padx=2, pady=2)
+
+        # Protection
+        frame_prot = ttk.LabelFrame(frame_slave_settings, text="Protection")
+        frame_prot.pack(side=tk.LEFT, padx=5, pady=5)
+
+        ttk.Label(frame_prot, text="MaxIch:").grid(row=0, column=0, sticky="w")
+        self.entry_ichmax = ttk.Entry(frame_prot, width=8)
+        self.entry_ichmax.insert(0, "5.0")
+        self.entry_ichmax.grid(row=0, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_prot, text="MaxIdis:").grid(row=1, column=0, sticky="w")
+        self.entry_idismax = ttk.Entry(frame_prot, width=8)
+        self.entry_idismax.insert(0, "8.0")
+        self.entry_idismax.grid(row=1, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_prot, text="ChCutV:").grid(row=2, column=0, sticky="w")
+        self.entry_ocvp = ttk.Entry(frame_prot, width=8)
+        self.entry_ocvp.insert(0, "3.65")
+        self.entry_ocvp.grid(row=2, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_prot, text="DchCutV:").grid(row=3, column=0, sticky="w")
+        self.entry_odvp = ttk.Entry(frame_prot, width=8)
+        self.entry_odvp.insert(0, "2.0")
+        self.entry_odvp.grid(row=3, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_prot, text="OvrTmp:").grid(row=4, column=0, sticky="w")
+        self.entry_overtemp = ttk.Entry(frame_prot, width=8)
+        self.entry_overtemp.insert(0, "55")
+        self.entry_overtemp.grid(row=4, column=1, padx=2, pady=2)
+
+        ttk.Label(frame_prot, text="I_Bal:").grid(row=5, column=0, sticky="w")
+        self.entry_ibal = ttk.Entry(frame_prot, width=8)
+        self.entry_ibal.insert(0, "0.0")
+        self.entry_ibal.grid(row=5, column=1, padx=2, pady=2)
+
+        ttk.Button(frame_prot, text="GET", command=self._get_protection).grid(row=6, column=0, padx=2, pady=2)
+        ttk.Button(frame_prot, text="SET", command=self._set_protection).grid(row=6, column=1, padx=2, pady=2)
+
+        # Switch Pattern
+        frame_switch = ttk.LabelFrame(frame_slave_settings, text="SwitchPattern")
+        frame_switch.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.list_pattern = tk.Listbox(frame_switch, width=10, height=5)
+        self.list_pattern.pack(padx=2, pady=2)
+        for i in range(2):
+            self.list_pattern.insert(tk.END, f"0x{i:02X}")
+
+        self.list_pattern.bind("<Double-Button-1>", self._edit_pattern_item)
+
+        f_sp_btns = ttk.Frame(frame_switch)
+        f_sp_btns.pack()
+
+        ttk.Button(f_sp_btns, text="UP", command=self._pattern_up).grid(row=0, column=0, padx=2, pady=2)
+        ttk.Button(f_sp_btns, text="DOWN", command=self._pattern_down).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Button(f_sp_btns, text="ADD", command=self._pattern_add).grid(row=1, column=0, padx=2, pady=2)
+        ttk.Button(f_sp_btns, text="DEL", command=self._pattern_del).grid(row=1, column=1, padx=2, pady=2)
+        ttk.Button(f_sp_btns, text="SET", command=self._pattern_set).grid(row=2, column=0, columnspan=2, padx=2, pady=2)
+
+        # =========== Serial Monitor (far right) ===============
+        frame_serial_monitor = ttk.LabelFrame(top_frame, text="Serial Monitor")
+        frame_serial_monitor.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+
+        self.text_serial = tk.Text(frame_serial_monitor, width=50, height=15)
+        self.text_serial.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        btn_clear = ttk.Button(frame_serial_monitor, text="Clear", command=self._clear_serial_monitor)
+        btn_copy  = ttk.Button(frame_serial_monitor, text="Copy",  command=self._copy_serial_monitor)
+        btn_clear.pack(side=tk.LEFT, padx=2, pady=2)
+        btn_copy.pack(side=tk.LEFT, padx=2, pady=2)
+
+        # ------------------- BOTTOM FRAME ------------------------------------
+        bottom_frame = ttk.Frame(self)
+        bottom_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+
+        # Left side -> Plot area
+        main_plot_frame = ttk.Frame(bottom_frame)
+        main_plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Data checkboxes
+        frame_data_checks = ttk.LabelFrame(main_plot_frame, text="Data to Plot")
+        frame_data_checks.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        self.var_vbat = tk.BooleanVar(value=True)
+        self.var_ibat = tk.BooleanVar(value=True)
+        self.var_soc  = tk.BooleanVar(value=True)
+        self.var_temp = tk.BooleanVar(value=False)
+        self.var_vtop = tk.BooleanVar(value=False)
+        self.var_vcc  = tk.BooleanVar(value=False)
+        self.var_ibal = tk.BooleanVar(value=False)
+
+        def mkcheck(txt, var):
+            return ttk.Checkbutton(frame_data_checks, text=txt, variable=var, command=self._update_plot)
+
+        mkcheck("V_bat", self.var_vbat).pack(side=tk.LEFT, padx=2)
+        mkcheck("I_bat", self.var_ibat).pack(side=tk.LEFT, padx=2)
+        mkcheck("SoC",   self.var_soc). pack(side=tk.LEFT, padx=2)
+        mkcheck("T",     self.var_temp).pack(side=tk.LEFT, padx=2)
+        mkcheck("V_top", self.var_vtop).pack(side=tk.LEFT, padx=2)
+        mkcheck("V_cc",  self.var_vcc). pack(side=tk.LEFT, padx=2)
+        mkcheck("I_bal", self.var_ibal).pack(side=tk.LEFT, padx=2)
+
+        self.fig = Figure(figsize=(6,4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.grid(True, linestyle='--', alpha=0.5)
+        self.ax.set_title("Battery Data vs Time")
+        self.ax.set_xlabel("Time (s)")
+
+        canvas = FigureCanvasTkAgg(self.fig, master=main_plot_frame)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas_mpl = canvas
+
+        # Recording
+        frame_record = ttk.LabelFrame(main_plot_frame, text="Recording")
+        frame_record.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        self.btn_start_log = ttk.Button(frame_record, text="StartLog", command=self._start_logging)
+        self.btn_stop_log  = ttk.Button(frame_record, text="StopLog",  command=self._stop_logging)
+        self.btn_reset     = ttk.Button(frame_record, text="ResetPlot", command=self._reset_plot)
+
+        self.btn_start_log.pack(side=tk.LEFT, padx=5, pady=5)
+        self.btn_stop_log.pack(side=tk.LEFT, padx=5, pady=5)
+        self.btn_reset.pack(side=tk.LEFT, padx=5, pady=5)
+
+        ttk.Label(frame_record, textvariable=self.data_rate_var).pack(side=tk.LEFT, padx=10)
+
+        # Right side -> bigger About/Help/Exit
+        right_bottom_frame = ttk.Frame(bottom_frame)
+        right_bottom_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+
+        style_btn_big = ttk.Style()
+        bigger_size = self.default_font.cget("size") + 2
+        style_btn_big.configure("Big.TButton", font=("TkDefaultFont", bigger_size, "bold"))
+
+        self.btn_about = ttk.Button(right_bottom_frame, text="ABOUT", style="Big.TButton", command=self._about)
+        self.btn_help  = ttk.Button(right_bottom_frame, text="HELP",  style="Big.TButton", command=self._help)
+        self.btn_exit  = ttk.Button(right_bottom_frame, text="EXIT",  style="Big.TButton", command=self._exit)
+
+        self.btn_about.pack(side=tk.TOP, padx=10, pady=5)
+        self.btn_help.pack(side=tk.TOP, padx=10, pady=5)
+        self.btn_exit.pack(side=tk.TOP, padx=10, pady=5)
+
+
+    # --------------------------------------------------------------------------
+    # Heartbeat check
+    # --------------------------------------------------------------------------
+    def _check_master_heartbeat(self):
+        now = time.time()
+        if (now - self.last_master_data_time) > 5.0:
+            if self.ser and self.ser.is_open:
+                self.connection_status_var.set("Master: Possibly disconnected/reset")
+                self.conn_led_color.set("red")
+                self._update_conn_led()
+        self.after(2000, self._check_master_heartbeat)
+
+    # --------------------------------------------------------------------------
+    # LED
+    # --------------------------------------------------------------------------
+    def _update_conn_led(self):
+        c = self.conn_led_canvas
+        c.delete("all")
+        color = self.conn_led_color.get()
+        c.create_oval(2, 2, 18, 18, fill=color)
+
+    # --------------------------------------------------------------------------
+    # COM Ports
+    # --------------------------------------------------------------------------
+    def _populate_com_ports(self):
+        ports = serial.tools.list_ports.comports()
+        self.combo_port["values"] = [p.device for p in ports]
+        if self.combo_port["values"]:
+            self.combo_port.current(0)
+
+    # --------------------------------------------------------------------------
+    # Open/Close Serial
+    # --------------------------------------------------------------------------
+    def _open_port(self):
+        if self.ser and self.ser.is_open:
+            self._close_port()
+            return
+        port = self.combo_port.get()
+        baud = self.combo_baud.get()
+        if not port:
+            messagebox.showerror("Error", "No COM port selected.")
+            return
+        try:
+            self.ser = serial.Serial(port, int(baud), timeout=0.1)
+            self.btn_open.config(text="Close Port")
+            self.serial_stop_event.clear()
+            self.serial_thread = SerialThread(self.ser, self.serial_queue, self.serial_stop_event)
+            self.serial_thread.start()
+
+            self.connection_status_var.set("Master: Connected")
+            self.conn_led_color.set("green")
+            self._update_conn_led()
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.ser = None
+            self.connection_status_var.set("Master: Port Error")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+
+    def _close_port(self):
+        if self.ser and self.ser.is_open:
+            self.serial_stop_event.set()
+            self.serial_thread.join(1.0)
+            self.ser.close()
+        self.ser = None
+        self.btn_open.config(text="Open Port")
+        self.connection_status_var.set("Master: Disconnected")
+        self.conn_led_color.set("red")
+        self._update_conn_led()
+
+    # --------------------------------------------------------------------------
+    # Serial Monitor
+    # --------------------------------------------------------------------------
+    def _clear_serial_monitor(self):
+        self.text_serial.delete("1.0", tk.END)
+
+    def _copy_serial_monitor(self):
+        txt = self.text_serial.get("1.0", tk.END)
+        pyperclip.copy(txt)
+
+    # --------------------------------------------------------------------------
+    # Write to Serial
+    # --------------------------------------------------------------------------
+    def _write_serial(self, cmd):
+        if self.ser and self.ser.is_open:
+            self.ser.write(cmd.encode("utf-8"))
+            self.text_serial.insert(tk.END, f"> {cmd.strip()}\n")
+            self.text_serial.see(tk.END)
+        else:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+
+    # --------------------------------------------------------------------------
+    # Check Queue
+    # --------------------------------------------------------------------------
+    def _check_serial_queue(self):
+        while not self.serial_queue.empty():
+            direction, line = self.serial_queue.get()
+            if direction == "IN":
+                self._parse_line(line)
+                self.text_serial.insert(tk.END, f"< {line}\n")
+                self.text_serial.see(tk.END)
+            elif direction == "ERROR":
+                self.connection_status_var.set("Master: Reset or Disconnected")
+                self.conn_led_color.set("red")
+                self._update_conn_led()
+        self.after(100, self._check_serial_queue)
+
+    # --------------------------------------------------------------------------
+    # Parse lines
+    # --------------------------------------------------------------------------
+    def _parse_line(self, line):
+        line = line.strip()
+
+        # If we get data from master, consider it connected
+        if self.ser and self.ser.is_open:
+            self.connection_status_var.set("Master: Connected")
+            self.conn_led_color.set("green")
+            self._update_conn_led()
+
+        # Update heartbeat
+        self.last_master_data_time = time.time()
+
+        # If line has "fault" or "timed out"
+        if "fault" in line.lower() or "timed out" in line.lower():
+            addr_match = re.search(r"Slave 0x([\da-fA-F]+)", line)
+            if addr_match:
+                fault_str = self._find_str_after(line, "FaultReg=")
+                if fault_str:
+                    # e.g. "101010 - 0x12"
+                    msg = f"{fault_str} - 0x{addr_match.group(1)}"
+                else:
+                    msg = f"??? - 0x{addr_match.group(1)}"
+                # For now we just add it to text_faults
+                self.text_faults.insert(tk.END, msg + "\n")
+                self.text_faults.see(tk.END)
+
+        # Removed / disconnected slaves
+        if "remov" in line.lower() or "delet" in line.lower():
+            m_rem = re.search(r"0x([\da-fA-F]+)", line)
+            if m_rem:
+                addr_int = int(m_rem.group(1), 16)
+                if addr_int in self.slaves:
+                    self.slaves.remove(addr_int)
+                if addr_int in self.data:
+                    del self.data[addr_int]
+                if addr_int in self.last_data:
+                    del self.last_data[addr_int]
+                self._refresh_slave_list()
+
+        # New slave
+        m_new = re.search(r"(New Slave assigned|Detected new slave at):?\s*0x([\da-fA-F]+)", line)
+        if m_new:
+            addr_hex = m_new.group(2)
+            addr_int = int(addr_hex, 16)
+            self.slaves.add(addr_int)
+            if addr_int not in self.data:
+                self._init_slave_data(addr_int)
+            self._refresh_slave_list()
+
+        # Battery or Protection GET responses
+        # ### NEW OR MODIFIED ###
+        # For "B" => "Slave 0x11 => BatteryType=2, FullV=4.20..., etc."
+        # For "P" => "Slave 0x11 => I_chmax=..., etc."
+        # We'll parse them & fill the GUI text boxes.
+        if ("BatteryType=" in line) or ("FullV=" in line) or ("EmptyV=" in line):
+            # We guess this is battery data
+            # e.g. "Slave 0x11 => BatteryType=2, FullV=4.20, EmptyV=3.00, Cap=10.00"
+            self._parse_battery_line(line)
+        elif ("I_chmax=" in line) or ("MaxIdis=" in line) or ("OvrTmp=" in line):
+            # We guess this is protection data
+            # e.g. "Slave 0x11 => I_chmax=5.0, I_dchmax=8.0, OvrTmp=55"
+            self._parse_protection_line(line)
+
+        # Normal slave data line
+        if line.startswith("Slave 0x"):
+            try:
+                addr_match = re.search(r"Slave 0x([\da-fA-F]+)", line)
+                addr_int = int(addr_match.group(1), 16)
+                vbat = self._find_float_after(line, "V=")
+                ibat = self._find_float_after(line, "I=")
+                soc  = self._find_float_after(line, "SoC=")
+                temp = self._find_float_after(line, "T=")
+                vcc  = self._find_float_after(line, "Vcc=")
+                ibal = self._find_float_after(line, "BalI=")
+                vtop = self._find_float_after(line, "TerV=")
+                fault_str = self._find_str_after(line, "FaultReg=")
+
+                # If not in data, init
+                if addr_int not in self.data:
+                    self._init_slave_data(addr_int)
+
+                t_now = time.time() - self.start_time
+                self.data[addr_int]["time"].append(t_now)
+                self.data[addr_int]["vbat"].append(vbat or 0)
+                self.data[addr_int]["ibat"].append(ibat or 0)
+                self.data[addr_int]["soc"].append(soc or 0)
+                self.data[addr_int]["temp"].append(temp or 0)
+                self.data[addr_int]["vcc"].append(vcc or 0)
+                self.data[addr_int]["ibal"].append(ibal or 0)
+                self.data[addr_int]["vtop"].append(vtop or 0)
+
+                self.last_data[addr_int] = (
+                    vbat or 0, ibat or 0, soc or 0, temp or 0,
+                    vtop or 0, vcc or 0, ibal or 0,
+                    fault_str if fault_str else ""
+                )
+
+                if self.logging and self.csv_writer:
+                    self._write_csv_row()
+
+                self.data_point_count += 1
+                self._update_plot()
+
+            except Exception:
+                pass
+
+    # ### NEW: parse battery line & fill GUI
+    def _parse_battery_line(self, line):
+        # e.g. "Slave 0x11 => BatteryType=2, FullV=4.20, EmptyV=3.00, Cap=10.0"
+        # We'll parse & fill the text boxes
+        bat_type_str = self._find_str_after(line, "BatteryType=")
+        fV_str       = self._find_str_after(line, "FullV=")
+        eV_str       = self._find_str_after(line, "EmptyV=")
+        cap_str      = self._find_str_after(line, "Cap=")
+        # set them
+        if bat_type_str:
+            self.combo_batt_type.set(bat_type_str)  # e.g. "2"
+        if fV_str:
+            # remove trailing "," or parse float
+            fV_clean = re.sub(r",", "", fV_str)
+            self.entry_fullv.delete(0, tk.END)
+            self.entry_fullv.insert(0, fV_clean)
+        if eV_str:
+            eV_clean = re.sub(r",", "", eV_str)
+            self.entry_emptyv.delete(0, tk.END)
+            self.entry_emptyv.insert(0, eV_clean)
+        if cap_str:
+            cap_clean = re.sub(r",", "", cap_str)
+            self.entry_capacity.delete(0, tk.END)
+            self.entry_capacity.insert(0, cap_clean)
+
+    # ### NEW: parse protection line & fill GUI
+    def _parse_protection_line(self, line):
+        # e.g. "Slave 0x11 => I_chmax=5.0, I_dchmax=8.0, OvrTmp=55.0"
+        ich_str  = self._find_str_after(line, "I_chmax=")
+        idis_str = self._find_str_after(line, "MaxIdis=")  # or "I_dchmax="
+        otmp_str = self._find_str_after(line, "OvrTmp=")
+        ocvp_str = self._find_str_after(line, "ChCutV=")
+        odvp_str = self._find_str_after(line, "DchCutV=")
+        ibal_str = self._find_str_after(line, "I_Bal=")
+
+        def clean_and_set(entry_widget, val_str):
+            if val_str:
+                val_clean = re.sub(r",", "", val_str)
+                entry_widget.delete(0, tk.END)
+                entry_widget.insert(0, val_clean)
+
+        clean_and_set(self.entry_ichmax, ich_str)
+        clean_and_set(self.entry_idismax, idis_str)
+        clean_and_set(self.entry_ocvp, ocvp_str)
+        clean_and_set(self.entry_odvp, odvp_str)
+        clean_and_set(self.entry_ibal, ibal_str)
+        clean_and_set(self.entry_overtemp, otmp_str)
+
+
+    def _init_slave_data(self, addr):
+        self.data[addr] = {
+            "time": [],
+            "vbat": [],
+            "ibat": [],
+            "soc":  [],
+            "temp": [],
+            "vtop": [],
+            "vcc":  [],
+            "ibal": []
+        }
+        self.last_data[addr] = (0,0,0,0,0,0,0,"")
+
+    def _refresh_slave_list(self):
+        old_selected = set()
+        for i in self.list_slaves.curselection():
+            txt = self.list_slaves.get(i)
+            if txt.startswith("0x"):
+                try:
+                    old_selected.add(int(txt[2:], 16))
+                except:
+                    pass
+        self.list_slaves.delete(0, tk.END)
+        for addr in sorted(self.slaves):
+            self.list_slaves.insert(tk.END, f"0x{addr:02X}")
+        # reselect
+        sorted_sl = sorted(self.slaves)
+        for i, addr in enumerate(sorted_sl):
+            if addr in old_selected:
+                self.list_slaves.select_set(i)
+
+    # --------------------------------------------------------------------------
+    # CSV for All Slaves in One Row
+    # --------------------------------------------------------------------------
+    def _write_csv_row(self):
+        """
+        ### NEW OR MODIFIED ###
+        Each time we get new data from ANY slave, we produce a row with zero-based time
+        if logging has just started.
+        """
+        if not self.csv_slaves_order:
+            self.csv_slaves_order = sorted(self.slaves)
+
+        # If we haven't set log_start_time yet, set it
+        if self.log_start_time is None:
+            self.log_start_time = time.time()
+
+        csv_time = time.time() - self.log_start_time
+
+        row = [f"{csv_time:.3f}"]
+        for s in self.csv_slaves_order:
+            if s in self.last_data:
+                (vbat, ibat, soc, temp, vtop, vcc, ibal, fval) = self.last_data[s]
+                row.append(f"{vbat:.3f}")
+                row.append(f"{ibat:.3f}")
+                row.append(f"{soc:.2f}")
+                row.append(f"{temp:.2f}")
+                row.append(f"{vtop:.3f}")
+                row.append(f"{vcc:.3f}")
+                row.append(f"{ibal:.3f}")
+                row.append(fval)
+            else:
+                row.extend(["","","","","","","",""])
+        self.csv_writer.writerow(row)
+
+    # --------------------------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------------------------
+    def _find_float_after(self, text, prefix):
+        pat = re.escape(prefix) + r"([\-\d\.]+)"
+        m = re.search(pat, text)
+        if m:
+            try:
+                return float(m.group(1))
+            except:
+                return None
+        return None
+
+    def _find_str_after(self, text, prefix):
+        pat = re.escape(prefix) + r"(\S+)"
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+        return ""
+
+    # --------------------------------------------------------------------------
+    # Data Rate
+    # --------------------------------------------------------------------------
+    def _check_data_rate(self):
+        now = time.time()
+        dt = now - self.last_rate_check
+        if dt >= 1.0:
+            rate = self.data_point_count / dt
+            self.data_rate_var.set(f"Data Rate: {rate:.1f} dp/s")
+            self.data_point_count = 0
+            self.last_rate_check = now
+        self.after(1000, self._check_data_rate)
+
+    # --------------------------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------------------------
+    def _update_plot(self):
+        """
+        ### NEW OR MODIFIED ###
+        We let the x-axis scroll horizontally by autoscaling.
+        """
+        self.ax.clear()
+        self.ax.grid(True, linestyle='--', alpha=0.5)
+        self.ax.set_title("Battery Data vs Time")
+        self.ax.set_xlabel("Time (s)")
+
+        sel = self.list_slaves.curselection()
+        if not sel:
+            self.canvas_mpl.draw()
+            return
+
+        for i in sel:
+            txt = self.list_slaves.get(i)
+            if txt.startswith("0x"):
+                addr_hex = txt[2:]
+                try:
+                    addr = int(addr_hex, 16)
+                except:
+                    continue
+
+                if addr not in self.data:
+                    continue
+
+                d = self.data[addr]
+                tvals = d["time"]
+                if self.var_vbat.get():
+                    self.ax.plot(tvals, d["vbat"], label=f"V_bat({txt})")
+                if self.var_ibat.get():
+                    self.ax.plot(tvals, d["ibat"], label=f"I_bat({txt})")
+                if self.var_soc.get():
+                    self.ax.plot(tvals, d["soc"], label=f"SoC({txt})")
+                if self.var_temp.get():
+                    self.ax.plot(tvals, d["temp"], label=f"T({txt})")
+                if self.var_vtop.get():
+                    self.ax.plot(tvals, d["vtop"], label=f"V_top({txt})")
+                if self.var_vcc.get():
+                    self.ax.plot(tvals, d["vcc"], label=f"V_cc({txt})")
+                if self.var_ibal.get():
+                    self.ax.plot(tvals, d["ibal"], label=f"I_bal({txt})")
+
+        self.ax.legend()
+        # autoscale to show new data without squeezing
+        self.ax.relim()
+        self.ax.autoscale_view(True, True, True)
+        self.canvas_mpl.draw()
+
+    # --------------------------------------------------------------------------
+    # Master Commands
+    # --------------------------------------------------------------------------
+    def _save_setting(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addr_ms = self.entry_addr_assign.get()
+        data_ms = self.entry_data_coll.get()
+        to_ms   = self.entry_timeout.get()
+        cmd = f"SETINT {addr_ms} {data_ms} {to_ms}\n"
+        self._write_serial(cmd)
+
+    def _set_freq(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        freq_str = self.entry_freq.get()
+        cmd = f"F {freq_str}\n"
+        self._write_serial(cmd)
+
+    def _send_save(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        self._write_serial("SAVE\n")
+
+    def _send_load(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        self._write_serial("LOAD\n")
+
+    # --------------------------------------------------------------------------
+    # Battery / Protection
+    # --------------------------------------------------------------------------
+    def _get_selected_slaves(self):
+        sel = self.list_slaves.curselection()
+        out = []
+        for i in sel:
+            txt = self.list_slaves.get(i)
+            if txt.startswith("0x"):
+                try:
+                    val = int(txt[2:], 16)
+                    out.append(val)
+                except:
+                    pass
+        return out
+
+    def _get_battery(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addrs = self._get_selected_slaves()
+        for a in addrs:
+            self._write_serial(f"B 0x{a:02X}\n")
+
+    def _set_battery(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addrs = self._get_selected_slaves()
+        if not addrs:
+            return
+        bat_type = self.combo_batt_type.get().split()[0]
+        fv = self.entry_fullv.get()
+        ev = self.entry_emptyv.get()
+        cap= self.entry_capacity.get()
+
+        self._write_serial(f"SETBATT {bat_type} {fv} {ev} {cap}\n")
+        for a in addrs:
+            self._write_serial(f"C 0x{a:02X}\n")
+
+    def _get_protection(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addrs = self._get_selected_slaves()
+        for a in addrs:
+            self._write_serial(f"P 0x{a:02X}\n")
+
+    def _set_protection(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addrs = self._get_selected_slaves()
+        if not addrs:
+            return
+        ich  = self.entry_ichmax.get()
+        idis = self.entry_idismax.get()
+        ocvp = self.entry_ocvp.get()
+        odvp = self.entry_odvp.get()
+        ibal = self.entry_ibal.get()
+        ot   = self.entry_overtemp.get()
+
+        self._write_serial(f"SETPROT {ich} {idis} {ocvp} {odvp} {ibal} {ot}\n")
+        for a in addrs:
+            self._write_serial(f"Q 0x{a:02X}\n")
+
+    # --------------------------------------------------------------------------
+    # Switch Pattern
+    # --------------------------------------------------------------------------
+    def _edit_pattern_item(self, event):
+        idx = self.list_pattern.curselection()
+        if not idx:
+            return
+        i = idx[0]
+        old_val = self.list_pattern.get(i)
+
+        def save_edit():
+            new_val = entry_val.get()
+            self.list_pattern.delete(i)
+            self.list_pattern.insert(i, new_val)
+            popup.destroy()
+
+        popup = tk.Toplevel(self)
+        popup.title("Edit Pattern Value")
+        tk.Label(popup, text="New Value:").pack(side=tk.LEFT, padx=5, pady=5)
+        entry_val = tk.Entry(popup, width=10)
+        entry_val.pack(side=tk.LEFT, padx=5, pady=5)
+        entry_val.insert(0, old_val)
+        tk.Button(popup, text="OK", command=save_edit).pack(side=tk.LEFT, padx=5, pady=5)
+
+    def _pattern_up(self):
+        sel = self.list_pattern.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        if i > 0:
+            txt = self.list_pattern.get(i)
+            self.list_pattern.delete(i)
+            self.list_pattern.insert(i-1, txt)
+            self.list_pattern.select_set(i-1)
+
+    def _pattern_down(self):
+        sel = self.list_pattern.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        if i < self.list_pattern.size() - 1:
+            txt = self.list_pattern.get(i)
+            self.list_pattern.delete(i)
+            self.list_pattern.insert(i+1, txt)
+            self.list_pattern.select_set(i+1)
+
+    def _pattern_add(self):
+        self.list_pattern.insert(tk.END, "0xFF")
+
+    def _pattern_del(self):
+        sel = self.list_pattern.curselection()
+        if sel:
+            self.list_pattern.delete(sel[0])
+
+    def _pattern_set(self):
+        if not self.ser or not self.ser.is_open:
+            self.connection_status_var.set("Master: Not responding")
+            self.conn_led_color.set("red")
+            self._update_conn_led()
+            return
+        addrs = self._get_selected_slaves()
+        if not addrs:
+            return
+        items = [self.list_pattern.get(i) for i in range(self.list_pattern.size())]
+        vals = []
+        for it in items:
+            if it.startswith("0x"):
+                try:
+                    v = int(it[2:], 16)
+                    vals.append(v)
+                except:
+                    vals.append(0)
+            else:
+                try:
+                    v = int(it)
+                    vals.append(v)
+                except:
+                    vals.append(0)
+        cmd_r = "R " + " ".join(str(v) for v in vals) + "\n"
+        self._write_serial(cmd_r)
+        for a in addrs:
+            self._write_serial(f"S 0x{a:02X}\n")
+
+    # --------------------------------------------------------------------------
+    # Logging
+    # --------------------------------------------------------------------------
+    def _start_logging(self):
+        if self.logging:
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=time.strftime("data_%Y%m%d_%H%M%S.csv")
+        )
+        if not file_path:
+            return
+        self.logfile = open(file_path, "w", newline="")
+        self.csv_writer = csv.writer(self.logfile)
+
+        # Build a dynamic header:
+        self.csv_slaves_order = sorted(self.slaves)
+        header = ["Time(s)"]
+        for s in self.csv_slaves_order:
+            s_hex = f"0x{s:02X}"
+            header.append(f"{s_hex}_Vbat")
+            header.append(f"{s_hex}_Ibat")
+            header.append(f"{s_hex}_SoC")
+            header.append(f"{s_hex}_Temp")
+            header.append(f"{s_hex}_Vtop")
+            header.append(f"{s_hex}_Vcc")
+            header.append(f"{s_hex}_Ibal")
+            header.append(f"{s_hex}_Faults")
+        self.csv_writer.writerow(header)
+
+        ### NEW OR MODIFIED ###
+        # Start CSV time from zero
+        self.log_start_time = time.time()
+
+        self.logging = True
+
+    def _stop_logging(self):
+        if self.logging:
+            self.logging = False
+            if self.logfile:
+                self.logfile.close()
+                self.logfile = None
+            self.csv_writer = None
+            self.csv_slaves_order = []
+            # Clear log_start_time
+            self.log_start_time = None
+
+    def _reset_plot(self):
+        self.start_time = time.time()
+        for addr in self.data:
+            for k in self.data[addr]:
+                self.data[addr][k].clear()
+        self._update_plot()
+
+    # --------------------------------------------------------------------------
+    # About / Help / Exit
+    # --------------------------------------------------------------------------
+    def _about(self):
+        messagebox.showinfo("About", "Developed by Walid Issa\nYear 2025, Version V1")
+
+    def _help(self):
+        messagebox.showinfo("Help", "Opening Help.pdf (if found).")
+        pdf_path = os.path.join(os.path.dirname(sys.argv[0]), "Help.pdf")
+        if os.path.exists(pdf_path):
+            if sys.platform.startswith("win"):
+                os.startfile(pdf_path)
+            else:
+                os.system(f'xdg-open "{pdf_path}"')
+
+    def _exit(self):
+        self._close_port()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = MultiBatteryGUI()
+    app.mainloop()
